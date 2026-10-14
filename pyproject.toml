@@ -1,0 +1,36 @@
+[project]
+name = "content-workbench"
+version = "0.1.0"
+description = "个人内容工作台：素材采集、选题提炼、按你的文风起草、批注改稿，推进公众号 / X / 知识星球草稿箱"
+authors = [
+    { name = "xiaocao", email = "31685224+xiaocao0710@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.143.0",
+    "httpx>=0.28.1",
+    "markdown-it-py>=4.2.0",
+    "pillow>=12.3.0",
+    "playwright==1.55.0",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.54.0",
+    "webauthn>=3.0.1",
+]
+
+[project.scripts]
+content-workbench = "content_workbench.app:main"
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
+
+[project.optional-dependencies]
+transcribe = ["mlx-whisper>=0.4.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

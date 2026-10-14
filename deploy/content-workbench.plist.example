@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.content-workbench</string>
+  <!-- Replace the three placeholders, copy to ~/Library/LaunchAgents/, then
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/content-workbench.plist
+       launchd may not exec files under ~/Documents (privacy protection) but the
+       interpreter outside it may read them, so this starts the interpreter and
+       adds the project venv's site-packages instead of running .venv/bin/*.
+       PYTHON:   an interpreter of the same version as the venv, e.g. ~/.local/bin/python3
+       PROJECT:  absolute path of this repository
+       DATA_DIR: ~/.local/share/content-workbench (where settings, database and logs live) -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>PYTHON</string>
+    <string>-c</string>
+    <string>import site, sys; site.addsitedir("PROJECT/.venv/lib/python3.13/site-packages"); sys.argv = ["content-workbench", "serve"]; from content_workbench.app import main; main()</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>LANG</key><string>en_US.UTF-8</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>DATA_DIR/server.log</string>
+  <key>StandardErrorPath</key><string>DATA_DIR/server.log</string>
+</dict>
+</plist>
