@@ -7,7 +7,7 @@ import { CasesPanel, FeedCard, FeishuLine, MediaPanel, PublishLongform, uploadIm
 import { RichEditor, type Selection } from '../RichEditor'
 import { CommentsPanel, DiffDialog, waiting } from './Comments'
 import { XhsPanel } from './Xhs'
-import { VideoPanel } from './Video'
+import { VideoCard } from './Video'
 import { locate, type Anchor } from '../commentAnchors'
 import type { Editor as TiptapEditor } from '@tiptap/react'
 
@@ -318,7 +318,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
                 active={activeThread} onActivate={focusThread} onChanged={loadThreads} onRevise={revise} busy={revising} />
             )}
             {tab === 'xhs' && !isX && <XhsPanel draft={draft} onDraft={setDraft} />}
-            {tab === 'video' && !isX && <VideoPanel draft={draft} onDraft={setDraft} />}
+            {tab === 'video' && !isX && <VideoCard draft={draft} onDraft={setDraft} />}
             {tab === 'cases' && <CasesPanel draftId={id} onUse={line => setNotes(n => (n.trim() ? n.trimEnd() + '\n' : '') + line)} />}
             {tab === 'preview' && !isX && <FeedCard draft={draft} title={title} summary={summary} body={body} />}
             {tab === 'media' && !isX && (

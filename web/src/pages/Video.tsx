@@ -1,14 +1,15 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api, type Draft, type DraftImage, type VideoItem, type VideoOptions, type VideoRow, type VideoScene, type VideoState } from '../api'
 import { AutoTextarea, useToast } from '../ui'
+import { go } from '../App'
 import { imgUrl } from './Longform'
 import * as Ic from '../icons'
 
-const TYPES: VideoScene['type'][] = ['hook', 'points', 'shot', 'stat', 'change', 'quote', 'cta']
-const TYPE_LABEL: Record<VideoScene['type'], string> = {
+export const TYPES: VideoScene['type'][] = ['hook', 'points', 'shot', 'stat', 'change', 'quote', 'cta']
+export const TYPE_LABEL: Record<VideoScene['type'], string> = {
   hook: '开头大字', points: '要点卡片', shot: '截图放大', stat: '数字', change: '前后对比', quote: '金句', cta: '结尾',
 }
-const TYPE_HINT: Record<VideoScene['type'], string> = {
+export const TYPE_HINT: Record<VideoScene['type'], string> = {
   hook: '一两行大字抛出这条视频的看点，可以再跟几张小卡片',
   points: '标题加 1 到 4 张卡片，读到哪条出哪条',
   shot: '真实截图放进窗口，读到某句时推近到框出的区域',
@@ -18,10 +19,10 @@ const TYPE_HINT: Record<VideoScene['type'], string> = {
   cta: '开源地址或链接、署名，片子在这里收尾',
 }
 
-const speakSec = (say: string) => say.replace(/[\s，。？！、：；,.?!:;“”]/g, '').length / 5.1 + 0.5
-const fmtDur = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)} 分 ${Math.round(sec % 60)} 秒` : `${Math.round(sec)} 秒`)
+export const speakSec = (say: string) => say.replace(/[\s，。？！、：；,.?!:;“”]/g, '').length / 5.1 + 0.5
+export const fmtDur = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)} 分 ${Math.round(sec % 60)} 秒` : `${Math.round(sec)} 秒`)
 const toLines = (text: string) => text.split('\n').map(x => x.trim()).filter(Boolean)
-const fmtSize = (b: number) => (b > 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.round(b / 1e3)} KB`)
+export const fmtSize = (b: number) => (b > 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.round(b / 1e3)} KB`)
 
 /** "文字｜说明" per line ⇄ items; a cue is kept only while the item still reads the same. */
 function itemsText(items: VideoItem[] | undefined, withSub: boolean) {
@@ -45,7 +46,7 @@ function textRows(text: string, old: VideoRow[] | undefined): VideoRow[] {
   })
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <label className="vfield">
       <span>{label}{hint && <em>{hint}</em>}</span>
@@ -106,7 +107,7 @@ function ImagePick({ images, value, onPick }: { images: DraftImage[]; value?: nu
   )
 }
 
-function SceneEditor({ scene, images, set }: { scene: VideoScene; images: DraftImage[]; set: (patch: Partial<VideoScene>) => void }) {
+export function SceneEditor({ scene, images, set }: { scene: VideoScene; images: DraftImage[]; set: (patch: Partial<VideoScene>) => void }) {
   const img = images.find(im => im.id === scene.image)
   const head = (
     <>
@@ -203,25 +204,28 @@ function SceneEditor({ scene, images, set }: { scene: VideoScene; images: DraftI
   }
 }
 
-/** Short vertical video of the long-form draft: AI script → author edits → rendered here. */
-export function VideoPanel({ draft, onDraft }: { draft: Draft; onDraft: (d: Draft) => void }) {
+/** The video of one long-form draft: script, voice, render job and the actions on
+ * them. Shared by the editor's 视频 card and the full-screen video workspace. */
+export function useVideo(draft: Draft | null, onDraft: (d: Draft) => void) {
   const toast = useToast()
-  const [s, setS] = useState<VideoState>(draft.video || {})
+  const [s, setS] = useState<VideoState>(draft?.video || {})
   const [opts, setOpts] = useState<VideoOptions | null>(null)
-  const [open, setOpen] = useState<number | null>(null)
   const [busy, setBusy] = useState('')
   const timer = useRef<number | undefined>(undefined)
   const pending = useRef<VideoScene[] | null>(null)
   const was = useRef(s.status)
+  const id = draft?.id
 
   useEffect(() => { api.get<VideoOptions>('/api/video/options').then(setOpts).catch(() => {}) }, [])
-  useEffect(() => { setS(draft.video || {}) }, [draft.id, draft.video?.planned_at, draft.video?.video?.rendered_at])
+  useEffect(() => { setS(draft?.video || {}); was.current = draft?.video?.status },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [id, draft?.video?.planned_at, draft?.video?.video?.rendered_at])
 
   // follow the job while the AI writes or the machine renders
   useEffect(() => {
-    if (!s.status) return
+    if (!s.status || !id) return
     const t = window.setInterval(async () => {
-      const d = await api.get<Draft>(`/api/drafts/${draft.id}`).catch(() => null)
+      const d = await api.get<Draft>(`/api/drafts/${id}`).catch(() => null)
       if (!d) return
       const v = d.video || {}
       setS(prev => ({ ...prev, status: v.status, stage: v.stage, pct: v.pct, error: v.error, video: v.video,
@@ -230,186 +234,112 @@ export function VideoPanel({ draft, onDraft }: { draft: Draft; onDraft: (d: Draf
         onDraft(d)
         if (v.error) toast(v.error, 'error')
         else if (was.current === 'rendering') toast('视频出好了')
-        else if (was.current === 'planning') { toast('脚本写好了，改完点“出片”'); setOpen(0) }
+        else if (was.current === 'planning') toast('脚本写好了，改完点“出片”')
       }
       was.current = v.status
     }, 3000)
     return () => window.clearInterval(t)
-  }, [s.status, draft.id, onDraft, toast])
+  }, [s.status, id, onDraft, toast])
+
+  const flush = useCallback(async () => {
+    window.clearTimeout(timer.current)
+    const next = pending.current
+    pending.current = null
+    if (next && id) await api.put(`/api/drafts/${id}/video`, { scenes: next }).catch(e => toast((e as Error).message, 'error'))
+  }, [id, toast])
+  // leaving the page saves what was typed in the last moment
+  useEffect(() => () => { void flush() }, [flush])
 
   const scenes = s.scenes || []
-  const images = (draft.images || []).filter(im => !im.name.startsWith('小红书-'))
-  const total = scenes.reduce((n, sc) => n + speakSec(sc.say || ''), 0)
-  const stale = !!(s.video && s.edited_at && s.edited_at > s.video.rendered_at)
-
   function saveScenes(next: VideoScene[]) {
     setS(st => ({ ...st, scenes: next, edited_at: Date.now() / 1000 }))
     pending.current = next
     window.clearTimeout(timer.current)
     timer.current = window.setTimeout(flush, 700)
   }
-  async function flush() {
-    window.clearTimeout(timer.current)
-    const next = pending.current
-    pending.current = null
-    if (next) await api.put(`/api/drafts/${draft.id}/video`, { scenes: next }).catch(e => toast((e as Error).message, 'error'))
-  }
-  const setScene = (i: number, patch: Partial<VideoScene>) => saveScenes(scenes.map((sc, j) => (j === i ? { ...sc, ...patch } : sc)))
-  function move(i: number, d: -1 | 1) {
-    const j = i + d
-    if (j < 0 || j >= scenes.length) return
-    const next = [...scenes]
-    ;[next[i], next[j]] = [next[j], next[i]]
-    saveScenes(next)
-    setOpen(j)
-  }
-  function remove(i: number) {
-    if (!window.confirm(`删掉第 ${i + 1} 个镜头？`)) return
-    saveScenes(scenes.filter((_, j) => j !== i))
-    setOpen(null)
-  }
-  function add() {
-    saveScenes([...scenes, { type: 'points', say: '', title: '' }])
-    setOpen(scenes.length)
-  }
-
   async function plan() {
+    if (!id) return
     if (scenes.length && !window.confirm('按现在的长文重新写视频脚本？你改过的镜头会被覆盖。')) return
-    try { const next = await api.post<VideoState>(`/api/drafts/${draft.id}/video/plan`); was.current = next.status; setS(next) } catch (e) { toast((e as Error).message, 'error') }
+    try { const next = await api.post<VideoState>(`/api/drafts/${id}/video/plan`); was.current = next.status; setS(next) } catch (e) { toast((e as Error).message, 'error') }
   }
   async function render() {
+    if (!id) return
     setBusy('render')
     try {
       await flush()
-      const next = await api.post<VideoState>(`/api/drafts/${draft.id}/video/render`)
+      const next = await api.post<VideoState>(`/api/drafts/${id}/video/render`)
       was.current = next.status
       setS(st => ({ ...st, status: next.status, stage: next.stage, pct: next.pct, error: null }))
     } catch (e) { toast((e as Error).message, 'error') } finally { setBusy('') }
   }
   async function setVoice(voice: string) {
     setS(st => ({ ...st, voice }))
-    await api.put(`/api/drafts/${draft.id}/video`, { voice }).catch(e => toast((e as Error).message, 'error'))
+    await api.put(`/api/drafts/${id}/video`, { voice }).catch(e => toast((e as Error).message, 'error'))
   }
   async function setBgm(bgm: boolean) {
     setS(st => ({ ...st, bgm }))
-    await api.put(`/api/drafts/${draft.id}/video`, { bgm }).catch(e => toast((e as Error).message, 'error'))
+    await api.put(`/api/drafts/${id}/video`, { bgm }).catch(e => toast((e as Error).message, 'error'))
   }
-  const src = s.video ? `/api/drafts/${draft.id}/video.mp4?v=${Math.round(s.video.rendered_at)}` : ''
+  const src = s.video && id ? `/api/drafts/${id}/video.mp4?v=${Math.round(s.video.rendered_at)}` : ''
   async function share() {
     setBusy('share')
     try {
       const blob = await (await fetch(src)).blob()
-      const file = new File([blob], `${(draft.title || '视频').slice(0, 20)}.mp4`, { type: 'video/mp4' })
+      const file = new File([blob], `${(draft?.title || '视频').slice(0, 20)}.mp4`, { type: 'video/mp4' })
       if (!navigator.canShare || !navigator.canShare({ files: [file] })) { toast('这台设备不支持直接分享视频，用“下载 MP4”', 'error'); return }
       await navigator.share({ files: [file] })
     } catch (e) {
       if ((e as Error).name !== 'AbortError') toast((e as Error).message, 'error')
     } finally { setBusy('') }
   }
+  return {
+    s, opts, busy, scenes, src, saveScenes, flush, plan, render, setVoice, setBgm, share,
+    total: scenes.reduce((n, sc) => n + speakSec(sc.say || ''), 0),
+    stale: !!(s.video && s.edited_at && s.edited_at > s.video.rendered_at),
+  }
+}
 
-  const warn = opts && !opts.tts
-    ? <div className="vnote warn small"><Ic.Alert size={14} /> 还没配置配音用的 Evolink key（设置文件里的 evolink_key_file），能写脚本，但出不了片。</div>
-    : null
+export function TtsWarning({ opts }: { opts: VideoOptions | null }) {
+  if (!opts || opts.tts) return null
+  return <div className="vnote warn small"><Ic.Alert size={14} /> 还没配置配音用的 Evolink key（设置文件里的 evolink_key_file），能写脚本，但出不了片。</div>
+}
 
-  if (s.status === 'planning') return (
-    <div className="stack">
-      <div className="row muted small"><Ic.Loader size={14} /> 正在看文章里的截图、写分镜脚本，一般两三分钟。</div>
-      <div className="skeleton" style={{ height: 120 }} /><div className="skeleton" style={{ height: 120 }} />
+export function RenderProgress({ s }: { s: VideoState }) {
+  return (
+    <div className="vprogress">
+      <div className="row small" style={{ justifyContent: 'space-between' }}><span><Ic.Loader size={13} /> {s.stage || '出片中'}</span><span className="faint">{s.pct || 0}%</span></div>
+      <div className="vbar"><i style={{ width: `${Math.max(3, s.pct || 0)}%` }} /></div>
+      <div className="small faint">在这台电脑上配音、对齐字幕、渲染，可以先去干别的，好了会在这里出现。</div>
     </div>
   )
+}
 
-  if (!scenes.length) return (
-    <div className="stack">
-      <div className="small muted">把这篇长文做成一条竖屏口播视频，发抖音、视频号和小红书。AI 先写分镜脚本：每个镜头说什么、画面上出什么字、用哪张截图、推近到哪一块。你改完点“出片”，在这台电脑上配音、对齐字幕、渲染成 MP4，两分钟的片子大约要三到五分钟。</div>
-      {warn}
-      {s.error && <div className="err small">{s.error}</div>}
-      <button className="btn primary" onClick={plan}><Ic.Sparkle size={14} /> 生成视频脚本</button>
-      <button className="btn ghost sm" onClick={add}><Ic.Plus size={13} /> 不用 AI，自己从空白写</button>
-    </div>
-  )
-
+/** The 视频 tab beside the long-form editor: where the video stands, and the way
+ * into the full-screen video workspace where it is made. */
+export function VideoCard({ draft, onDraft }: { draft: Draft; onDraft: (d: Draft) => void }) {
+  const v = useVideo(draft, onDraft)
+  const { s, scenes } = v
+  const open = async () => { await v.flush(); go(`videos/${draft.id}`) }
   return (
     <div className="stack video">
-      {warn}
-      {s.status === 'rendering' ? (
-        <div className="vprogress">
-          <div className="row small" style={{ justifyContent: 'space-between' }}><span><Ic.Loader size={13} /> {s.stage || '出片中'}</span><span className="faint">{s.pct || 0}%</span></div>
-          <div className="vbar"><i style={{ width: `${Math.max(3, s.pct || 0)}%` }} /></div>
-          <div className="small faint">在这台电脑上配音、对齐字幕、渲染，可以先去干别的，好了会在这里出现。</div>
-        </div>
-      ) : s.video ? (
+      {s.status === 'planning' ? (
+        <div className="row muted small"><Ic.Loader size={14} /> 正在看文章里的截图、写分镜脚本，一般两三分钟。</div>
+      ) : s.status === 'rendering' ? <RenderProgress s={s} /> : s.video ? (
         <div className="vresult">
-          <video key={src} className="vplayer" src={src} controls playsInline preload="metadata" />
+          <video key={v.src} className="vplayer" src={v.src} controls playsInline preload="metadata" />
           <div className="vresult-side">
             <div className="small muted">{fmtDur(s.video.duration)} · 1080×1920 · {fmtSize(s.video.size)}</div>
-            {stale && <div className="vnote small"><Ic.Alert size={13} /> 脚本改过了，重新出片才会更新。</div>}
-            <button className="btn primary sm" disabled={!!busy} onClick={render}><Ic.Film size={14} /> 重新出片</button>
+            {v.stale && <div className="vnote small"><Ic.Alert size={13} /> 脚本改过了，重新出片才会更新。</div>}
             <a className="btn sm" href={`/api/drafts/${draft.id}/video.mp4?download=1`}><Ic.Download size={14} /> 下载 MP4</a>
-            <button className="btn sm mobile-share" disabled={!!busy} onClick={share}>{busy === 'share' ? <Ic.Loader size={14} /> : <Ic.Send size={14} />} 分享到手机 App</button>
+            <button className="btn sm mobile-share" disabled={!!v.busy} onClick={v.share}>{v.busy === 'share' ? <Ic.Loader size={14} /> : <Ic.Send size={14} />} 分享到手机 App</button>
           </div>
         </div>
-      ) : null}
-      {s.error && !s.status && <div className="err small">{s.error}</div>}
-
-      <div className="vbar-head">
-        <div className="small"><b>{scenes.length}</b> 个镜头 · 约 {fmtDur(total)}</div>
-        <div className="row" style={{ gap: 6 }}>
-          {opts && (
-            <select className="input sm" value={s.voice || opts.default_voice} onChange={e => setVoice(e.target.value)} aria-label="配音音色">
-              {opts.voices.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-            </select>
-          )}
-          {opts?.bgm && (
-            <label className="vcheck small"><input type="checkbox" checked={s.bgm !== false} onChange={e => setBgm(e.target.checked)} /> 配乐</label>
-          )}
-        </div>
-      </div>
-      {!s.video && s.status !== 'rendering' && (
-        <button className="btn primary" disabled={!!busy || !scenes.some(sc => sc.say.trim())} onClick={render}><Ic.Film size={15} /> 出片</button>
+      ) : (
+        <div className="small muted">把这篇长文做成一条竖屏口播视频，发抖音、视频号和小红书。AI 先写分镜脚本，你在视频工作区里一个镜头一个镜头地改、当场预览，满意了再出片。</div>
       )}
-
-      <ol className="vscenes">
-        {scenes.map((sc, i) => {
-          const isOpen = open === i
-          const clip = s.video?.scenes?.[i]
-          return (
-            <li key={i} className={'vscene' + (isOpen ? ' open' : '')}>
-              <button type="button" className="vscene-head" onClick={() => setOpen(isOpen ? null : i)} aria-expanded={isOpen}>
-                <span className="vnum">{i + 1}</span>
-                <span className="vtype">{TYPE_LABEL[sc.type]}</span>
-                <span className="vsay">{sc.say || <i className="faint">还没写口播</i>}</span>
-                <span className="faint small vsec">{Math.round(speakSec(sc.say || ''))}″</span>
-              </button>
-              {isOpen && (
-                <div className="vscene-body">
-                  <div className="row" style={{ gap: 6, justifyContent: 'space-between' }}>
-                    <select className="input sm" value={sc.type} onChange={e => setScene(i, { type: e.target.value as VideoScene['type'] })} aria-label="镜头类型">
-                      {TYPES.map(t => <option key={t} value={t}>{TYPE_LABEL[t]}</option>)}
-                    </select>
-                    <div className="row" style={{ gap: 2 }}>
-                      {clip && <button type="button" className="btn ghost icon sm" title="听上次出片的这段配音"
-                        onClick={() => new Audio(`/api/drafts/${draft.id}/video/voice/${i + 1}?v=${Math.round(s.video!.rendered_at)}`).play()}><Ic.Play size={13} /></button>}
-                      <button type="button" className="btn ghost icon sm" aria-label="往前" disabled={i === 0} onClick={() => move(i, -1)}><Ic.Up size={14} /></button>
-                      <button type="button" className="btn ghost icon sm" aria-label="往后" disabled={i === scenes.length - 1} onClick={() => move(i, 1)}><Ic.Down size={14} /></button>
-                      <button type="button" className="btn ghost icon sm" aria-label="删掉这个镜头" onClick={() => remove(i)}><Ic.Trash size={14} /></button>
-                    </div>
-                  </div>
-                  <div className="small faint">{TYPE_HINT[sc.type]}</div>
-                  <Field label="口播" hint="这个镜头读出来的话">
-                    <AutoTextarea className="textarea vsay-input" value={sc.say} onChange={e => setScene(i, { say: e.target.value })} />
-                  </Field>
-                  <SceneEditor scene={sc} images={images} set={p => setScene(i, p)} />
-                </div>
-              )}
-            </li>
-          )
-        })}
-      </ol>
-      <div className="row" style={{ gap: 6 }}>
-        <button className="btn ghost sm" onClick={add}><Ic.Plus size={13} /> 加一个镜头</button>
-        <button className="btn ghost sm" onClick={plan}><Ic.Sparkle size={13} /> 重新生成脚本</button>
-      </div>
-      <div className="small faint">口播里的数字和英文名照常写，配音会自动读对；读错的字可以换个说法。画面上的字从口播里提炼，读到哪里出到哪里。</div>
+      {s.error && !s.status && <div className="err small">{s.error}</div>}
+      {scenes.length > 0 && <div className="small"><b>{scenes.length}</b> 个镜头 · 约 {fmtDur(v.total)}</div>}
+      <button className="btn primary" onClick={open}><Ic.Film size={15} /> 打开视频工作区</button>
     </div>
   )
 }

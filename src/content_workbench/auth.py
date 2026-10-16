@@ -209,7 +209,8 @@ class Guard(BaseHTTPMiddleware):
         response = await call_next(request)
         if "cache-control" not in response.headers:
             response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Frame-Options"] = "DENY"
+        # the video editor shows its instant scene preview in a same-origin frame
+        response.headers["X-Frame-Options"] = "SAMEORIGIN" if "/video/preview/" in path else "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response

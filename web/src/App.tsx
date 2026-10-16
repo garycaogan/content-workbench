@@ -9,6 +9,8 @@ import { Editor } from './pages/Editor'
 import { Publications } from './pages/Publications'
 import { SettingsPage } from './pages/Settings'
 import { Habits } from './pages/Habits'
+import { Videos } from './pages/Videos'
+import { VideoStudio } from './pages/VideoStudio'
 import { ToastProvider } from './ui'
 import * as Ic from './icons'
 
@@ -74,13 +76,16 @@ function Root() {
     { key: 'materials', label: '素材', icon: <Ic.Inbox />, count: status?.counts.materials },
     { key: 'ideas', label: '选题', icon: <Ic.Bulb />, count: status?.counts.ideas_new, hot: !!status?.counts.ideas_new },
     { key: 'drafts', label: '稿件', icon: <Ic.Doc />, count: status?.counts.drafts },
+    { key: 'videos', label: '视频', icon: <Ic.Film /> },
     { key: 'published', label: '已发布', icon: <Ic.Send /> },
     { key: 'habits', label: '改稿习惯', icon: <Ic.Sparkle /> },
   ]
 
   let body: ReactNode
-  const fullBleed = (route.page === 'drafts' && !!route.id) || route.page === 'materials'
+  const fullBleed = ((route.page === 'drafts' || route.page === 'videos') && !!route.id) || route.page === 'materials'
   if (route.page === 'drafts' && route.id) body = <Editor id={route.id} status={status} />
+  else if (route.page === 'videos' && route.id) body = <VideoStudio id={route.id} />
+  else if (route.page === 'videos') body = <Videos />
   else if (route.page === 'materials') body = <Materials openId={route.id} />
   else if (route.page === 'ideas') body = <Ideas />
   else if (route.page === 'drafts') body = <Drafts />
@@ -140,7 +145,7 @@ function Root() {
       <nav className="tabbar" aria-label="主导航">
         {[nav[0], nav[2]].map(n => <TabButton key={n.key} n={n} current={current} />)}
         <button aria-label="记一笔" onClick={startCapture}><span className="fab"><Ic.Plus size={22} /></span></button>
-        {[nav[3], nav[1]].map(n => <TabButton key={n.key} n={n} current={current} />)}
+        {[nav[3], nav[1]].map(n => <TabButton key={n.key} n={n} current={current === 'videos' ? 'drafts' : current} />)}
       </nav>
     </div>
   )

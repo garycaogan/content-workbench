@@ -19,8 +19,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +53,8 @@ TYPE_NAMES = {"hook": "开头大字", "points": "要点卡片", "shot": "截图�
               "quote": "金句", "cta": "结尾"}
 SAY_MAX = 160
 PUNCT = "，。？！、：；,.?!:;—…“”\"'（）()《》「」【】 \n"
+# a render and an editor preview can both reach for Whisper or the font cache
+_WHISPER_LOCK, _FONT_LOCK = threading.Lock(), threading.Lock()
 
 
 class VideoError(RuntimeError):
@@ -241,8 +245,9 @@ def heard_chars(path: Path, vocab: str = "") -> list[tuple[str, float, float]]:
     Only a short vocabulary prompt: given the whole line, Whisper copies it and
     stops giving word times after the first garbled character."""
     import mlx_whisper
-    res = mlx_whisper.transcribe(str(path), path_or_hf_repo=WHISPER, language="zh", word_timestamps=True,
-                                 initial_prompt=vocab_prompt(vocab))
+    with _WHISPER_LOCK:
+        res = mlx_whisper.transcribe(str(path), path_or_hf_repo=WHISPER, language="zh", word_timestamps=True,
+                                     initial_prompt=vocab_prompt(vocab))
     chars = []
     for seg in res.get("segments", []):
         for w in seg.get("words", []):
@@ -395,16 +400,29 @@ def font_source() -> Path:
     return path
 
 
+def static_font(weight: int) -> Path:
+    """One weight cut out of the variable font, kept on disk: cutting takes about
+    3 s a weight, subsetting the cut font about 0.2 s, and previews need it fast."""
+    path = data_dir() / "video" / f"NotoSansSC-{weight}.ttf"
+    with _FONT_LOCK:
+        if not path.exists():
+            from fontTools.ttLib import TTFont
+            from fontTools.varLib import instancer
+            font = instancer.instantiateVariableFont(TTFont(font_source()), {"wght": weight})
+            tmp = path.with_suffix(".part")
+            font.save(tmp)
+            tmp.rename(path)
+    return path
+
+
 def subset_fonts(text: str, out_dir: Path) -> None:
     """Four static weights of Noto Sans SC holding just the characters on screen."""
     from fontTools import subset
     from fontTools.ttLib import TTFont
-    from fontTools.varLib import instancer
     chars = set(text) | set(chr(c) for c in range(0x20, 0x7F)) | set("，。？！、：；“”‘’（）《》「」—…·→←✓$")
     out_dir.mkdir(parents=True, exist_ok=True)
-    src = font_source()
     for w in vs.WEIGHTS:
-        font = instancer.instantiateVariableFont(TTFont(src), {"wght": w})
+        font = TTFont(static_font(w))
         opts = subset.Options()
         opts.layout_features = ["*"]
         opts.notdef_outline = True
@@ -598,6 +616,27 @@ def _image_for(scene: dict, assets: Path) -> dict | None:
     return {"src": f"assets/{name}", "w": image["width"], "h": image["height"]}
 
 
+def voice_cache(voice: str, spoken: str) -> Path:
+    """Where the voice for this exact line and voice is kept (render and preview share it)."""
+    cache = data_dir() / "video-cache"
+    cache.mkdir(exist_ok=True)
+    return cache / (hashlib.sha1(f"{voice}|{INSTRUCTION}|{spoken}".encode()).hexdigest()[:16] + ".wav")
+
+
+def timed_line(spoken: str, raw: Path, clip: Path, vocab: str, use_whisper: bool) -> dict:
+    """The cached voice padded into the scene's clip, and when each character is
+    said (cached next to the voice)."""
+    ffmpeg("-i", str(raw), "-af", f"adelay={int(LEAD_S * 1000)},apad=pad_dur={TAIL_S}", "-ar", "48000", "-ac", "1", str(clip))
+    duration = max(2.0, duration_of(clip))
+    saved = raw.with_suffix(f".{LEAD_S}-{TAIL_S}{'-w' if use_whisper else ''}.times.json")
+    if saved.exists():
+        times = [tuple(t) if t else None for t in json.loads(saved.read_text())]
+    else:
+        times = align(spoken, heard_chars(clip, vocab) if use_whisper else [], duration)
+        saved.write_text(json.dumps(times))
+    return {"clip": clip, "raw": raw, "duration": duration, "times": times}
+
+
 def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], list[float]]:
     """Voice, timing and every composition, ready for the HyperFrames CLI."""
     draft = db.row("SELECT * FROM drafts WHERE id=?", (draft_id,))
@@ -612,15 +651,12 @@ def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], 
     assets = root / "assets"
     (assets / "audio").mkdir(parents=True)
     (root / "compositions").mkdir()
-    cache = data_dir() / "video-cache"
-    cache.mkdir(exist_ok=True)
 
     # 1. voice, one clip per scene (cached by the exact text and voice; new lines in parallel)
     todo = []
     for scene in scenes:
         spoken, segs = speakable(scene["say"])
-        raw = cache / (hashlib.sha1(f"{voice}|{INSTRUCTION}|{spoken}".encode()).hexdigest()[:16] + ".wav")
-        todo.append((spoken, segs, raw))
+        todo.append((spoken, segs, voice_cache(voice, spoken)))
     missing = [(spoken, raw) for spoken, _segs, raw in todo if not raw.exists()]
     done = len(todo) - len(missing)
     _progress(draft_id, f"配音 {done}/{len(todo)}", 5)
@@ -628,23 +664,14 @@ def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], 
         for _ in pool.map(lambda job: synth(key, job[0], voice, job[1]), missing):
             done += 1
             _progress(draft_id, f"配音 {done}/{len(todo)}", int(5 + 25 * done / len(todo)))
-    lines = []
-    for n, (spoken, segs, raw) in enumerate(todo, 1):
-        clip = assets / "audio" / f"voice-{n:02d}.wav"
-        ffmpeg("-i", str(raw), "-af", f"adelay={int(LEAD_S * 1000)},apad=pad_dur={TAIL_S}", "-ar", "48000", "-ac", "1", str(clip))
-        lines.append({"spoken": spoken, "segs": segs, "clip": clip, "raw": raw, "duration": max(2.0, duration_of(clip))})
 
     # 2. when each character is said (cached next to the voice clip)
     use_whisper = whisper_available()
-    for n, line in enumerate(lines, 1):
-        _progress(draft_id, f"对齐字幕 {n}/{len(lines)}", int(30 + 15 * n / len(lines)))
-        saved = line["raw"].with_suffix(f".{LEAD_S}-{TAIL_S}{'-w' if use_whisper else ''}.times.json")
-        if saved.exists():
-            line["times"] = [tuple(t) if t else None for t in json.loads(saved.read_text())]
-        else:
-            heard = heard_chars(line["clip"], settings.transcribe_vocab) if use_whisper else []
-            line["times"] = align(line["spoken"], heard, line["duration"])
-            saved.write_text(json.dumps(line["times"]))
+    lines = []
+    for n, (spoken, segs, raw) in enumerate(todo, 1):
+        _progress(draft_id, f"对齐字幕 {n}/{len(todo)}", int(30 + 15 * n / len(todo)))
+        line = timed_line(spoken, raw, assets / "audio" / f"voice-{n:02d}.wav", settings.transcribe_vocab, use_whisper)
+        lines.append({**line, "spoken": spoken, "segs": segs})
 
     # 3. compositions
     _progress(draft_id, "准备画面", 46)
@@ -712,6 +739,108 @@ def render(settings: Settings, draft_id: int) -> dict:
     info = {"duration": duration_of(final), "size": final.stat().st_size, "rendered_at": db.now(),
             "scenes": [{"start": s, "duration": ln["duration"]} for s, ln in zip(starts, lines)]}
     return update(draft_id, video=info, status="", stage="", pct=100, error=None)
+
+
+# ------------------------------------------------------------------ instant preview of one scene
+
+PREVIEW_KEEP = 8  # built previews kept per draft
+# a preview is kept under a hash of what it shows, and of the code that drew it
+_PREVIEW_CODE = hashlib.sha1(Path(vs.__file__).read_bytes() + Path(__file__).read_bytes()).hexdigest()[:8]
+
+
+def preview_dir(draft_id: int) -> Path:
+    return data_dir() / "video-preview" / f"draft-{draft_id}"
+
+
+def preview(settings: Settings, draft_id: int, index: int, scene: dict, last: bool = False, speak: bool = False) -> dict:
+    """One scene as a page the browser plays: the composition, captions and author
+    mark the render uses, without encoding anything. The page only seeks; the
+    editor plays the voice and drives the picture from it.
+
+    The voice is made only when asked (speak) and is cached by text, so editing a
+    line costs nothing until you listen; until then the timing is estimated and
+    the preview is silent. A preview is kept under a hash of what it shows, so
+    flipping back to an earlier version is instant."""
+    draft = db.row("SELECT * FROM drafts WHERE id=?", (draft_id,))
+    if not draft:
+        raise VideoError("找不到这篇长文")
+    state = load(draft)
+    s = normalize(scene, {im["id"] for im in images.for_draft(draft_id)}, keep_type=True)
+    if not s["say"].strip():
+        raise VideoError("这个镜头还没写口播")
+    voice = state.get("voice") or settings.video_voice or VOICES[0]["id"]
+    spoken, segs = speakable(s["say"])
+    raw = voice_cache(voice, spoken)
+    if speak and not raw.exists():
+        synth(evolink_key(settings), spoken, voice, raw)
+    voiced = raw.exists()
+    author = settings.author or prompts.persona(settings)["name"]
+    key = hashlib.sha1(json.dumps([s, voice, voiced, index, last, author, settings.video_tagline, _PREVIEW_CODE], ensure_ascii=False,
+                                  sort_keys=True).encode()).hexdigest()[:12]
+    base = preview_dir(draft_id)
+    root = base / key
+    if not (root / "meta.json").exists():
+        tmp = base / f".{key}-{secrets.token_hex(4)}"
+        assets = tmp / "assets"
+        (assets / "audio").mkdir(parents=True)
+        if voiced:
+            line = timed_line(spoken, raw, assets / "audio" / "voice.wav", settings.transcribe_vocab, whisper_available())
+            duration, times = line["duration"], line["times"]
+        else:
+            duration = max(2.0, estimate_seconds([s]) + LEAD_S + TAIL_S)
+            times = align(spoken, [], duration)
+        data = dict(s)
+        if s.get("image"):
+            data["image"] = _image_for(s, assets)
+        sid = f"s{index + 1:02d}"
+        cue = make_cue(s["say"], segs, times, 0.0, duration)
+        groups = caption_groups(caption_chunks(s["say"], spoken, segs, times))
+        parts = [vs.scene_html(sid, data, duration, cue, final=last), vs.captions_html(groups, duration),
+                 vs.chrome_html(author, settings.video_tagline, duration + 30)]  # the mark never fades inside a scene
+        # the mark has long finished fading in by the second scene
+        (tmp / "index.html").write_text(vs.preview_html(parts, duration, {"chrome": 0.0 if index == 0 else 1.0}), encoding="utf-8")
+        shown = vs.all_text([s]) + "".join(w["text"] for g in groups for w in g["words"]) + author + settings.video_tagline
+        subset_fonts(shown, assets / "fonts")
+        (tmp / "meta.json").write_text(json.dumps({"duration": duration, "voiced": voiced}), encoding="utf-8")
+        if root.exists():  # a twin request finished first
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            tmp.rename(root)
+    os.utime(root)
+    built = sorted((p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    stray = [p for p in base.iterdir() if p.name.startswith(".") and time.time() - p.stat().st_mtime > 600]
+    for old in built[PREVIEW_KEEP:] + stray:
+        shutil.rmtree(old, ignore_errors=True)
+    meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    url = f"/api/drafts/{draft_id}/video/preview/{key}/"
+    return {"url": url + "index.html", "audio": url + "assets/audio/voice.wav" if meta["voiced"] else None,
+            "duration": meta["duration"], "voiced": meta["voiced"]}
+
+
+def preview_file(draft_id: int, key: str, path: str) -> Path | None:
+    root = (preview_dir(draft_id) / key).resolve()
+    target = (root / path).resolve()
+    if not re.fullmatch(r"[0-9a-f]{12}", key) or root not in target.parents or not target.is_file():
+        return None
+    return target
+
+
+# ------------------------------------------------------------------ the 视频 page
+
+def overview() -> list[dict]:
+    """Every long-form draft with where its video stands, most recently touched first."""
+    out = []
+    for d in db.rows("SELECT id, title, body, status, video, updated_at FROM drafts WHERE platform='wechat' "
+                     "ORDER BY updated_at DESC"):
+        v = load(d)
+        scenes = v.get("scenes") or []
+        out.append({"id": d["id"], "title": d["title"], "draft_status": d["status"], "updated_at": d["updated_at"],
+                    "has_body": bool(d["body"].strip()), "status": v.get("status") or "", "stage": v.get("stage") or "",
+                    "pct": v.get("pct") or 0, "error": v.get("error"), "scenes": len(scenes),
+                    "seconds": estimate_seconds(scenes), "planned_at": v.get("planned_at"), "edited_at": v.get("edited_at"),
+                    "video": v.get("video")})
+    return out
 
 
 def options(settings: Settings) -> dict:

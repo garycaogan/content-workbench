@@ -708,6 +708,79 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .vfocus { position: relative; border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); cursor: crosshair; touch-action: none; user-select: none; max-height: 420px; }
 .vfocus img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
 .vfocus-box { position: absolute; border: 2.5px solid var(--accent); border-radius: 6px; box-shadow: 0 0 0 9999px rgba(15, 20, 25, .35); pointer-events: none; }
+/* the 视频 page and the full-screen video workspace */
+.vlist + .vlist { margin-top: 26px; }
+.vlist-thumb { width: 32px; height: 56px; border-radius: 7px; overflow: hidden; background: var(--surface-3); color: var(--muted);
+  display: grid; place-items: center; flex-shrink: 0; }
+.vlist-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
+
+.studio { --pv-w: 380px; display: flex; flex-direction: column; height: 100vh; min-width: 0; }
+.studio-top { display: flex; align-items: center; gap: 10px; min-height: 56px; padding: 0 16px; border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: saturate(1.4) blur(10px); flex-shrink: 0; }
+.studio-top .crumb { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.studio-top .crumb .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.studio-top .right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.studio-center { flex: 1; display: grid; place-items: center; padding: 24px 16px; overflow: auto; }
+.studio-h { font-size: 16px; font-weight: 650; margin: 0; line-height: 1.4; }
+.studio-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 280px minmax(0, 1fr) var(--pv-w); }
+
+.studio-scenes { border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
+.studio-scenes-head { padding: 14px 16px 10px; color: var(--muted); }
+.studio-scenes-head b { color: var(--text); font-weight: 600; }
+.studio-scenes ol { list-style: none; margin: 0; padding: 0 10px 12px; display: flex; flex-direction: column; gap: 6px; overflow: auto; flex: 1; min-height: 0; }
+.sc-card { display: flex; flex-direction: column; gap: 5px; width: 100%; text-align: left; padding: 9px 10px; border-radius: var(--r-md);
+  border: 1px solid var(--border); background: var(--surface); cursor: pointer; font: inherit; color: inherit; transition: border-color .12s, background .12s; }
+.sc-card:hover { border-color: var(--border-strong); }
+.sc-card.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 55%, var(--surface)); }
+.sc-card.playing .vnum { background: var(--accent); color: var(--on-accent); }
+.sc-top { display: flex; align-items: center; gap: 7px; }
+.sc-top .vsec { margin-left: auto; }
+.sc-say { font-size: 13px; line-height: 1.55; color: var(--text-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.studio-scenes-foot { display: flex; gap: 4px; flex-wrap: wrap; padding: 10px; border-top: 1px solid var(--border); }
+
+.studio-edit { overflow: auto; min-width: 0; }
+.studio-edit-inner { max-width: 640px; margin: 0 auto; padding: 22px 28px 64px; display: flex; flex-direction: column; gap: 12px; }
+.studio-edit-head { display: flex; align-items: center; gap: 10px; }
+.studio-edit .vfocus { max-height: 480px; }
+
+.studio-preview { border-left: 1px solid var(--border); background: var(--surface); padding: 14px 16px 20px; overflow: auto;
+  display: flex; flex-direction: column; gap: 12px; }
+.studio-preview .segmented { align-self: center; }
+.spv { display: flex; flex-direction: column; gap: 10px; }
+.spv-frame { position: relative; align-self: center; height: min(calc(100vh - 236px), calc((var(--pv-w) - 32px) * 16 / 9)); aspect-ratio: 9 / 16;
+  max-width: 100%; border-radius: 16px; overflow: hidden; background: #f6f6f3; border: 1px solid var(--border); box-shadow: var(--shadow-sm); }
+.spv-frame iframe, .spv-frame video { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
+.spv-frame video { background: #000; object-fit: contain; }
+.spv-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; text-align: center; }
+.spv-busy { position: absolute; top: 10px; right: 10px; display: inline-flex; gap: 5px; align-items: center; padding: 3px 9px;
+  border-radius: 100px; background: rgba(24, 24, 27, .72); color: #fff; font-size: 12px; }
+.spv-controls { display: flex; align-items: center; gap: 10px; }
+.spv-bar { flex: 1; height: 18px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
+.spv-bar span { flex: 1; height: 6px; border-radius: 100px; background: var(--surface-3); overflow: hidden; }
+.spv-bar i { display: block; height: 100%; background: var(--accent); }
+.spv-time { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.spv-note { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 8px 10px;
+  border-radius: var(--r-md); background: var(--surface-2); color: var(--muted); }
+
+@media (max-width: 1180px) {
+  .studio { --pv-w: 330px; }
+  .studio-body { grid-template-columns: 230px minmax(0, 1fr) var(--pv-w); }
+  .studio-edit-inner { padding: 18px 20px 56px; }
+}
+@media (max-width: 900px) {
+  .studio { height: auto; min-height: 100vh; }
+  .studio-top { position: sticky; top: 0; z-index: 10; padding: 8px 10px; gap: 6px; flex-wrap: wrap; }
+  .studio-top .crumb .pill, .studio-doc { display: none; }
+  .studio-top .crumb { flex: 1 1 0; }
+  .studio-body { display: flex; flex-direction: column; }
+  .studio-preview { order: -1; border-left: 0; border-bottom: 1px solid var(--border); overflow: visible; }
+  .spv-frame { height: min(58vh, 520px); }
+  .studio-scenes { border-right: 0; border-bottom: 1px solid var(--border); }
+  .studio-scenes ol { flex-direction: row; overflow-x: auto; padding-bottom: 12px; }
+  .studio-scenes li { flex: 0 0 200px; }
+  .studio-edit { overflow: visible; }
+  .studio-edit-inner { padding: 16px 16px 96px; }
+}
 @media (max-width: 720px) {
   .vresult { grid-template-columns: minmax(0, 1fr); }
   .vplayer { max-height: 70vh; width: auto; margin: 0 auto; }

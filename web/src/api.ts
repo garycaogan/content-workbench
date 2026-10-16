@@ -75,6 +75,14 @@ export type VideoState = {
   error?: string | null; planned_at?: number; edited_at?: number
   video?: { duration: number; size: number; rendered_at: number; scenes: { start: number; duration: number }[] }
 }
+/** One long-form draft on the 视频 page. */
+export type VideoOverview = {
+  id: number; title: string; draft_status: string; updated_at: number; has_body: boolean
+  status: '' | 'planning' | 'rendering'; stage: string; pct: number; error: string | null
+  scenes: number; seconds: number; planned_at?: number; edited_at?: number; video: VideoState['video'] | null
+}
+/** A scene built for the browser to play (see video.preview on the server). */
+export type VideoPreview = { url: string; audio: string | null; duration: number; voiced: boolean }
 export type VideoOptions = { voices: { id: string; name: string; desc: string }[]; default_voice: string; tts: boolean
   whisper: boolean; bgm: boolean; types: Record<string, string> }
 export type XhsCover = { kicker?: string; lines?: string[]; highlight?: string; subtitle?: string; pills?: string[] }

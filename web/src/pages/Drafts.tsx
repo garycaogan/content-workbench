@@ -30,6 +30,7 @@ export function Drafts() {
         <div className="actions">
           <button className="btn" onClick={() => blank('wechat')}><Ic.Doc size={14} /> 新长文</button>
           <button className="btn" onClick={() => blank('x')}><Ic.XLogo size={12} /> 新 X 推文</button>
+          <button className="btn mobile-only" onClick={() => go('videos')}><Ic.Film size={14} /> 视频</button>
         </div>
       </div>
 

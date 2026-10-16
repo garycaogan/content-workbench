@@ -781,6 +781,10 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
     def video_options():
         return video.options(settings)
 
+    @app.get("/api/videos")
+    def videos():
+        return video.overview()
+
     def _video_draft(did: int) -> dict:
         draft = db.row("SELECT * FROM drafts WHERE id=?", (did,))
         if not draft:
@@ -840,6 +844,26 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             return FileResponse(path, media_type="video/mp4")
         name = re.sub(r"[^\w\u4e00-\u9fff-]+", "", draft["title"] or "视频")[:24] or "video"
         return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+
+    @app.post("/api/drafts/{did}/video/preview")
+    def video_preview(did: int, body: dict = Body(...)):
+        """One scene, built for the browser to play (no rendering): see video.preview."""
+        _video_draft(did)
+        if not isinstance(body.get("scene"), dict):
+            raise HTTPException(400, "缺少镜头")
+        try:
+            return video.preview(settings, did, max(0, int(body.get("index") or 0)), body["scene"],
+                                 last=bool(body.get("last")), speak=bool(body.get("speak")))
+        except video.VideoError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.get("/api/drafts/{did}/video/preview/{key}/{path:path}")
+    def video_preview_file(did: int, key: str, path: str):
+        target = video.preview_file(did, key, path)
+        if not target:
+            raise HTTPException(404)
+        # a preview's folder is named after what it shows, so its files never change
+        return FileResponse(target, headers={"Cache-Control": "private, max-age=86400"})
 
     @app.get("/api/drafts/{did}/video/voice/{n}")
     def video_voice(did: int, n: int):

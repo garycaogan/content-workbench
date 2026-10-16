@@ -734,6 +734,58 @@ def index_html(scenes: list[dict], starts: list[float], durations: list[float], 
 """
 
 
+def preview_html(parts: list[str], duration: float, offsets: dict[str, float]) -> str:
+    """The editor's instant preview of one scene: the same compositions stacked on
+    one 1080×1920 stage, scaled to the frame. The page only seeks; the editor
+    calls window.cwSeek(t) from the voice it plays, so picture and sound stay in
+    step. offsets shift a layer's clock (the author mark is already in place
+    after the first scene)."""
+    layers = []
+    for part in parts:
+        inner = part.strip().removeprefix("<template>").removesuffix("</template>").replace(GSAP, "")
+        layers.append(f'<div class="layer">{inner}</div>')
+    poster = round(max(0.0, duration * 0.85 - 0.3), 3)  # most of the scene is on screen by then
+    return f"""<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    {GSAP}
+    <style>
+      * {{ margin: 0; padding: 0; box-sizing: border-box; }}  /* as in index_html, or boxes come out wider */
+      html, body {{ width: 100%; height: 100%; overflow: hidden; background: {BG}; }}
+      #stage {{ position: absolute; left: 0; top: 0; width: {W}px; height: {H}px; overflow: hidden; background: {BG};
+        transform-origin: 0 0; }}
+      .layer {{ position: absolute; inset: 0; }}
+    </style>
+    <script>window.__timelines = {{}};</script>
+  </head>
+  <body>
+    <div id="stage">
+{chr(10).join(layers)}
+    </div>
+    <script>
+      (function () {{
+        const stage = document.getElementById("stage");
+        const fit = () => {{ stage.style.transform = "scale(" + Math.min(innerWidth / {W}, innerHeight / {H}) + ")"; }};
+        fit();
+        addEventListener("resize", fit);
+        const offsets = {json.dumps(offsets)};
+        let last = {poster};
+        window.cwDuration = {duration:.3f};
+        window.cwPoster = {poster};
+        window.cwSeek = (t) => {{
+          last = t;
+          for (const [id, tl] of Object.entries(window.__timelines)) tl.seek(Math.max(0, t + (offsets[id] || 0)));
+        }};
+        window.cwSeek(last);
+        if (document.fonts) document.fonts.ready.then(() => window.cwSeek(last));
+      }})();
+    </script>
+  </body>
+</html>
+"""
+
+
 def all_text(scenes: list[dict]) -> str:
     """Every visible string, for the font subset."""
     out = []

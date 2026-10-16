@@ -117,3 +117,69 @@ def test_plan_render_guard_and_edit_api(monkeypatch):
     assert r.status_code == 400 and "Evolink" in r.json()["detail"]
     assert c.get(f"/api/drafts/{did}/video.mp4").status_code == 404
     assert c.get("/api/video/options").json()["voices"][0]["id"] == "longanyang_v3.1"
+
+
+def _no_fonts(monkeypatch):
+    def fake(text, out_dir):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for w in vs.WEIGHTS:
+            (out_dir / f"noto-{w}.woff2").write_bytes(b"font")
+    monkeypatch.setattr(video, "subset_fonts", fake)
+
+
+def test_videos_page_lists_long_form_drafts_with_their_state():
+    c = client()
+    login(c)
+    did = new_longform(c, body="正文")
+    c.post("/api/drafts", json={"platform": "x", "title": "推文", "body": "x"}, headers=H)
+    c.put(f"/api/drafts/{did}/video", json={"scenes": [{"type": "hook", "say": "写公众号只干两件事", "words": ["说话"]}]}, headers=H)
+    rows = c.get("/api/videos").json()
+    assert [r["id"] for r in rows] == [did]
+    assert rows[0]["scenes"] == 1 and rows[0]["has_body"] and rows[0]["status"] == "" and rows[0]["video"] is None
+
+
+def test_scene_preview_plays_in_the_browser_and_speaks_only_when_asked(monkeypatch):
+    _no_fonts(monkeypatch)
+    monkeypatch.setattr(video, "whisper_available", lambda: False)
+    c = client()
+    login(c)
+    did = new_longform(c, body="正文")
+    pic, = upload(c, did, png())
+    scene = {"type": "shot", "say": "看这张图，866 篇里挑出 62 篇", "title": "截图", "image": pic, "focus": [0.1, 0.1, 0.6, 0.5]}
+
+    # no voice yet: silent, timing estimated, nothing sent to the TTS
+    def no_tts(*a, **kw):
+        raise AssertionError("preview must not synthesise unless asked")
+    monkeypatch.setattr(video, "synth", no_tts)
+    p = c.post(f"/api/drafts/{did}/video/preview", json={"index": 1, "scene": scene}, headers=H).json()
+    assert p["voiced"] is False and p["audio"] is None and p["duration"] > 2
+    page = c.get(p["url"])
+    assert page.status_code == 200 and page.headers["x-frame-options"] == "SAMEORIGIN"
+    html = page.text
+    assert 'data-composition-id="s02"' in html and 'window.__timelines["captions"]' in html and "window.cwSeek" in html
+    assert "<template>" not in html and html.count("gsap.min.js") == 1
+    base = p["url"].rsplit("/", 1)[0]
+    assert c.get(f"{base}/assets/img-{pic}.png").status_code == 200 and c.get(f"{base}/assets/fonts/noto-700.woff2").status_code == 200
+    assert c.get(f"{base}/../../video.mp4").status_code == 404 and c.get(f"/api/drafts/{did}/video/preview/zzz/index.html").status_code == 404
+    assert c.get("/api/videos").headers["x-frame-options"] == "DENY"
+
+    # asking to hear it needs a key, then makes the voice once and keeps it
+    assert "Evolink" in c.post(f"/api/drafts/{did}/video/preview", json={"index": 1, "scene": scene, "speak": True}, headers=H).json()["detail"]
+    import wave
+    made = []
+
+    def fake_synth(key, text, voice, out):
+        made.append(text)
+        with wave.open(str(out), "wb") as w:
+            w.setnchannels(1), w.setsampwidth(2), w.setframerate(24000), w.writeframes(b"\0\0" * 24000 * 3)
+    monkeypatch.setattr(video, "synth", fake_synth)
+    monkeypatch.setattr(video, "evolink_key", lambda s: "k")
+    p2 = c.post(f"/api/drafts/{did}/video/preview", json={"index": 1, "scene": scene, "speak": True}, headers=H).json()
+    assert p2["voiced"] and p2["audio"] and p2["url"] != p["url"] and 3.0 < p2["duration"] < 4.0
+    assert made == ["看这张图，八百六十六 篇里挑出 六十二 篇"]
+    assert c.get(p2["audio"]).status_code == 200
+    # the same scene again: same page, no new voice; a visual edit reuses the voice
+    assert c.post(f"/api/drafts/{did}/video/preview", json={"index": 1, "scene": scene}, headers=H).json()["url"] == p2["url"]
+    p3 = c.post(f"/api/drafts/{did}/video/preview", json={"index": 1, "scene": {**scene, "title": "换个标题"}}, headers=H).json()
+    assert p3["voiced"] and p3["url"] != p2["url"] and len(made) == 1
+    assert c.post(f"/api/drafts/{did}/video/preview", json={"index": 0, "scene": {"type": "hook", "say": " "}}, headers=H).status_code == 400
