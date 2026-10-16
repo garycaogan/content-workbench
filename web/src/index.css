@@ -370,10 +370,11 @@ svg { flex-shrink: 0; }
 .add-tweet { margin-left: 48px; }
 
 .side { border-left: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
-.side-tabs { display: flex; gap: 2px; padding: 10px 12px; border-bottom: 1px solid var(--border); height: 56px; align-items: center; }
+/* tabs wrap onto a second row rather than scroll: a hidden scrollbar hid 视频 and everything after it */
+.side-tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 12px; border-bottom: 1px solid var(--border); min-height: 56px; align-items: center; flex-shrink: 0; }
 .side-tabs button {
-  border: none; background: none; height: 32px; padding: 0 11px; border-radius: var(--r-sm); cursor: pointer; color: var(--muted);
-  font-size: 13px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px;
+  border: none; background: none; height: 32px; padding: 0 7px; border-radius: var(--r-sm); cursor: pointer; color: var(--muted);
+  font-size: 13px; font-weight: 500; display: inline-flex; align-items: center; gap: 5px;
 }
 .side-tabs button:hover { background: var(--surface-2); color: var(--text); }
 .side-tabs button[aria-selected="true"] { background: var(--surface-3); color: var(--text); }
@@ -514,7 +515,6 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 
 /* ------------------------------------------------------------------ long-form: covers, pictures, publish checks */
 
-.side-tabs { overflow-x: auto; scrollbar-width: none; }
 .side-tabs button { white-space: nowrap; flex-shrink: 0; }
 .media-panel section { display: flex; flex-direction: column; gap: 8px; }
 .media-panel section + section { padding-top: 14px; border-top: 1px solid var(--border); }
