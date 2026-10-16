@@ -192,6 +192,7 @@ MIGRATIONS = {
         # the last AI revision from comments: {"before": version id, "after": version id, "summary", "at", "threads"}
         "last_revision": "TEXT",
         "xhs": "TEXT",                       # 小红书 version: title, body, tags, cards, picture ids
+        "video": "TEXT",                     # short video: scenes (script), voice, render state, last MP4
     },
 }
 

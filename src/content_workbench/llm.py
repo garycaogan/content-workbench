@@ -58,8 +58,11 @@ SCYS_TOOLS = [f"mcp__scys-mcp__{name}" for name in (
     "searchNavigatorContent", "getNavigatorContentDetail", "searchDeepseaCourseChapters")]
 
 
-def run(prompt: str, timeout: int = 600, tools: list[str] | None = None, max_turns: int = 2) -> str:
-    cmd = [claude_bin(), "-p", "--output-format", "json", "--max-turns", str(max_turns), "--disallowedTools", DENY]
+def run(prompt: str, timeout: int = 600, tools: list[str] | None = None, max_turns: int = 2, allow_read: bool = False) -> str:
+    """allow_read lets the model open files we put in its working directory (the
+    video planner looks at the article's screenshots that way); nothing else changes."""
+    deny = ",".join(t for t in DENY.split(",") if not (allow_read and t == "Read"))
+    cmd = [claude_bin(), "-p", "--output-format", "json", "--max-turns", str(max_turns), "--disallowedTools", deny]
     if tools:
         cmd += ["--allowedTools", ",".join(tools)]
     workdir = data_dir() / "llm-cwd"

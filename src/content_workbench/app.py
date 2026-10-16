@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
@@ -11,7 +12,7 @@ from pathlib import Path
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import auth, comments, db, images, jobs, learning, llm, prompts, publish, sources, xarticle, xhs, zsxq
+from . import auth, comments, db, images, jobs, learning, llm, prompts, publish, sources, video, xarticle, xhs, zsxq
 from .config import SecretStore, Settings, data_dir, ensure_setup_code
 from .textutil import normalize_emphasis, thread_report, wechat_html
 
@@ -20,7 +21,8 @@ WX_COVER_MAX = 9 * 1024 * 1024          # permanent image material: 10MB
 X_IMAGE_MAX = 5 * 1024 * 1024 - 4096    # X pictures: 5MB
 DRAFT_FIELDS = ("title", "body", "notes", "summary", "source_url")
 
-WEB_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
+# CW_WEB_DIST lets a test instance serve a build without touching the live web/dist
+WEB_DIST = Path(os.environ.get("CW_WEB_DIST") or Path(__file__).resolve().parents[2] / "web" / "dist")
 SECRET_KEYS = ("x_client_id", "x_client_secret", "wx_appid", "wx_secret")
 
 
@@ -323,6 +325,7 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
         found["images"] = images.for_draft(did)
         found["cover_crop"] = db.loads(found.get("cover_crop"), {})
         found["xhs"] = xhs.load(found)
+        found["video"] = video.load(found)
         return found
 
     @app.put("/api/drafts/{did}")
@@ -772,6 +775,79 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
         from urllib.parse import quote
         return Response(xhs.zip_bytes(state), media_type="application/zip",
                         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}.zip"})
+
+    # ------------------------------------------------------------ 视频
+    @app.get("/api/video/options")
+    def video_options():
+        return video.options(settings)
+
+    def _video_draft(did: int) -> dict:
+        draft = db.row("SELECT * FROM drafts WHERE id=?", (did,))
+        if not draft:
+            raise HTTPException(404)
+        return draft
+
+    @app.post("/api/drafts/{did}/video/plan")
+    def video_plan(did: int):
+        draft = _video_draft(did)
+        if not draft["body"].strip():
+            raise HTTPException(400, "长文还是空的")
+        state = video.load(draft)
+        if state.get("status"):
+            return state
+        state.update(status="planning", stage="正在看截图、写脚本", pct=0, error=None)
+        video.save(did, state)
+        jobs.enqueue("video_plan", {"draft_id": did})
+        return state
+
+    @app.put("/api/drafts/{did}/video")
+    def video_update(did: int, body: dict = Body(...)):
+        state = video.load(_video_draft(did))
+        if isinstance(body.get("scenes"), list):
+            allowed = {im["id"] for im in images.for_draft(did)}
+            state["scenes"] = [video.normalize(s, allowed, keep_type=True) for s in body["scenes"] if isinstance(s, dict)][:16]
+            state["edited_at"] = db.now()
+        if body.get("voice") in {v["id"] for v in video.VOICES}:
+            state["voice"] = body["voice"]
+        if "bgm" in body:
+            state["bgm"] = bool(body["bgm"])
+        video.save(did, state)
+        return state
+
+    @app.post("/api/drafts/{did}/video/render")
+    def video_render(did: int):
+        state = video.load(_video_draft(did))
+        if state.get("status"):
+            return state
+        if not any(str(s.get("say", "")).strip() for s in state.get("scenes") or []):
+            raise HTTPException(400, "脚本是空的，先生成或写几个镜头")
+        try:
+            video.evolink_key(settings)
+        except video.VideoError as exc:
+            raise HTTPException(400, str(exc)) from None
+        state.update(status="rendering", stage="排队中", pct=0, error=None)
+        video.save(did, state)
+        jobs.enqueue("video_render", {"draft_id": did})
+        return state
+
+    @app.get("/api/drafts/{did}/video.mp4")
+    def video_file(did: int, download: int = 0):
+        draft = _video_draft(did)
+        path = video.video_path(did)
+        if not path.exists():
+            raise HTTPException(404)
+        if not download:
+            return FileResponse(path, media_type="video/mp4")
+        name = re.sub(r"[^\w\u4e00-\u9fff-]+", "", draft["title"] or "视频")[:24] or "video"
+        return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+
+    @app.get("/api/drafts/{did}/video/voice/{n}")
+    def video_voice(did: int, n: int):
+        _video_draft(did)
+        path = video.work_dir(did) / "assets" / "audio" / f"voice-{n:02d}.wav"
+        if not path.exists():
+            raise HTTPException(404)
+        return FileResponse(path, media_type="audio/wav")
 
     # ------------------------------------------------------------ 知识星球
     @app.get("/api/zsxq")

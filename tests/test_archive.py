@@ -130,8 +130,30 @@ def test_persona_defaults_are_generic_and_configurable():
     from content_workbench.config import Settings
     plain_one = prompts.build_extract(Settings(), {"source": "note", "title": "t", "body": "b"})
     assert "Gary" not in plain_one and "深海圈" not in plain_one and "你在帮 作者从他的工作记录里" in plain_one
+    assert "（暂无）" in plain_one
     mine = Settings(author="小王", persona={"identity": "独立开发者", "x_style": "我在 X 上爱用短句。"})
     assert "你在帮 小王（独立开发者）从" in prompts.build_extract(mine, {"source": "note", "title": "t", "body": "b"})
     x = prompts.build_draft(mine, "x", {"title": "t", "angle": ""}, None, [])
     assert "我在 X 上爱用短句。" in x and "生财 MCP" not in x
     assert "生财 MCP" in prompts.build_draft(Settings(case_search="scys"), "wechat", {"title": "t", "angle": ""}, None, [])
+
+
+def test_extract_sees_existing_ideas_so_a_talk_is_not_split_three_ways(monkeypatch):
+    from content_workbench.config import Settings
+    with db.tx() as conn:
+        mid = conn.execute("INSERT INTO materials(source, title, body, created_at) VALUES ('note', '直播重构版', ?, ?)",
+                           ("第一段。\n\n" * 3, db.now())).lastrowid
+        conn.execute("INSERT INTO ideas(title, status, created_at) VALUES ('自动化是1后面的0', 'new', ?)", (db.now(),))
+        conn.execute("INSERT INTO ideas(title, status, created_at) VALUES ('不要了的那个选题', 'dropped', ?)", (db.now(),))
+    prompts_seen = []
+
+    def fake_run(prompt, **kw):
+        prompts_seen.append(prompt)
+        return json.dumps({"ideas": [{"title": f"新选题{len(prompts_seen)}", "quotes": []}]}, ensure_ascii=False)
+    monkeypatch.setattr(llm, "run", fake_run)
+    monkeypatch.setattr(jobs, "CHUNK", 8)  # two pieces
+    jobs._extract(Settings(), {"material_id": mid})
+    assert len(prompts_seen) >= 2
+    assert "- 自动化是1后面的0" in prompts_seen[0] and "- 不要了的那个选题" in prompts_seen[0]
+    assert "- 新选题1" in prompts_seen[1]  # what the first piece found counts as existing for the next
+    assert db.row("SELECT COUNT(*) n FROM ideas WHERE material_id=?", (mid,))["n"] == len(prompts_seen)

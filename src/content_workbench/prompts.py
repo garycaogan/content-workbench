@@ -117,6 +117,9 @@ EXTRACT = """你在帮 {name}{identity_paren}从他的工作记录里找能发 X
 他已经在公众号发过下面这些文章。和其中某篇主题基本重复的选题不要列；如果是已发文章里没展开的新角度、新案例、新数据，可以列，在 notes 里写明和哪篇有关。
 {published}
 
+工作台里已经有下面这些选题（包括他挑过和不要了的）。和其中某个基本重复的不要再列，同一场直播或会议的文字稿、重写稿常常会分好几份进来，同一个观点只算一次；同一件事有了新的案例、新的数据或者新的判断，可以列，在 notes 里写明和哪个已有选题有关。
+{existing}
+
 {name} 的身份和边界（节选自《{manual_title}》）：
 {manual}
 
@@ -305,11 +308,13 @@ def build_revise_comments(settings: Settings, draft: dict, todo: str, others: st
                                   **persona(settings))
 
 
-def build_extract(settings: Settings, material: dict) -> str:
+def build_extract(settings: Settings, material: dict, existing: list[str] | None = None) -> str:
     from .sources import published_titles
     published = "\n".join(f"- {t}" for t in published_titles(settings.kb_root)) or "（暂无）"
-    return EXTRACT.format(manual=boss_manual(settings)[:3000], published=published, source=material["source"],
-                          title=material["title"], body=material["body"][:40000], **persona(settings))
+    existing_text = "\n".join(f"- {t}" for t in existing or [] if t.strip()) or "（暂无）"
+    return EXTRACT.format(manual=boss_manual(settings)[:3000], published=published, existing=existing_text,
+                          source=material["source"], title=material["title"], body=material["body"][:40000],
+                          **persona(settings))
 
 
 def build_draft(settings: Settings, platform: str, idea: dict, material: dict | None, quotes: list[str]) -> str:

@@ -36,6 +36,8 @@
 
 ![自动画的图卡](docs/images/xhs-cards.jpg)
 
+**短视频**：把长文做成一条竖屏口播视频（抖音、视频号、小红书）。AI 先写分镜脚本：每个镜头读什么、画面上出什么字、用哪张截图、推近到哪一块（它会先看一遍文章里的截图）。你在侧栏里改口播、换镜头类型（开头大字、要点卡片、截图放大、数字、前后对比、金句、结尾）、在截图上拖框选要推近的区域，点“出片”，这台电脑就配音、对齐字幕、渲染成 1080×1920 的 MP4，两分钟的片子大约三到五分钟。画面用 [HyperFrames](https://github.com/heygen-com/hyperframes)（HTML + GSAP 渲染成视频）生成，每个镜头的元素在读到对应那句话时出现。手机上点“分享到手机 App”直接发。
+
 **留档**：每篇稿子在飞书的固定文件夹里只对应一个文档，停笔一分半钟后自动同步（正文、图片、发布信息、小红书版），改动看飞书的历史版本。你在飞书里直接改过的，工作台不会覆盖，会停下来等你决定。
 
 **找案例**（可选）：如果你是生财有术的会员，可以开启生财 MCP，起稿和改稿时 AI 会去深海圈帖子、精华区、项目案例库里找真实案例，出处写进备注。
@@ -48,12 +50,13 @@
 - 小红书个人号没有发布接口，工作台只负责把图和字准备好，最后在小红书 App 里存草稿或发布。
 - 知识星球没有开放接口，用的是星球网页自己调的接口，星球改版时可能需要跟着改。
 - 起稿和改稿调用的是你电脑上登录的 Claude Code（你自己的订阅），文字会发给 Anthropic 处理，不是离线运行。
+- 短视频的配音调用 Evolink 的中文 TTS（按量计费，一条两分钟的片子几分钱），口播文字会发给它处理；对齐字幕和渲染在本机。
 
 ## 怎么装
 
 最省事的办法：把这个仓库的链接丢给你自己的 Claude Code 或 Codex，让它照着这份说明帮你装、帮你配。下面是它需要知道的。
 
-需要：macOS（录音转写用 Apple 芯片上的 mlx-whisper，开机自启用 launchd）、Python 3.13 和 [uv](https://docs.astral.sh/uv/)、Node 18+、已登录的 Claude Code。可选：飞书的 lark-cli（飞书素材和留档）、Playwright 的 Chromium（知识星球扫码）、cloudflared（外网访问）。
+需要：macOS（录音转写和视频字幕对齐用 Apple 芯片上的 mlx-whisper，开机自启用 launchd）、Python 3.13 和 [uv](https://docs.astral.sh/uv/)、Node 22+、ffmpeg、已登录的 Claude Code。短视频第一次出片时会用 npx 下载 HyperFrames 和它的无头 Chrome（`npx hyperframes browser ensure`），字体（Noto Sans SC，OFL）从 Google Fonts 的仓库下载到数据目录。可选：飞书的 lark-cli（飞书素材和留档）、Playwright 的 Chromium（知识星球扫码）、cloudflared（外网访问）。
 
 ```bash
 git clone https://github.com/garycaogan/content-workbench.git && cd content-workbench
@@ -97,9 +100,13 @@ uv sync --extra transcribe            # 不需要录音转写就去掉 --extra t
 | `voice_guide_path` | 你的文风指南（Markdown），写得越具体，底稿越像你 |
 | `manual_path` | 你的身份和边界说明，哪些话不说、哪些承诺不做 |
 | `kb_root` / `skill_dir` | 可选：你的知识库和一套写作脚本（找最接近的历史文章当样本、文风检查） |
-| `transcribe_vocab` | 录音转写时常见的词 |
+| `transcribe_vocab` | 录音转写和视频字幕对齐时常见的词，逗号隔开 |
 | `case_search` | 填 `scys` 开启生财 MCP 找案例 |
 | `zsxq_group_id` / `zsxq_group_name` | 知识星球草稿存到哪个星球（星球网页地址里 `groupId=` 后面那串数字），也可以在设置页填 |
+| `evolink_key_file` | 短视频配音用的 Evolink API key 文件（权限 600） |
+| `video_voice` | 默认音色，比如 `longanyang_v3.1`，视频页里也能换 |
+| `video_tagline` | 视频左上角名字下面的一行小字 |
+| `video_bgm` | 背景音乐文件（wav/mp3），不填就用数据目录里的 `video/bgm.wav`，都没有就不配乐 |
 
 平台凭证（X、公众号、知识星球）在设置页里填或扫码，只存在本机的 `secrets.json`，页面上只显示“已填/未填”。
 

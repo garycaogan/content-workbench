@@ -46,6 +46,10 @@ export const Image = (p: P) => <I {...p}><rect x="3" y="3" width="18" height="18
 export const Logout = (p: P) => <I {...p}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></I>
 export const Feishu = (p: P) => <I {...p}><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5z" /><path d="M8 11.5 12 14l4-2.5" /></I>
 export const Waves = Wave
+export const Film = (p: P) => <I {...p}><rect x="5" y="2" width="14" height="20" rx="2.5" /><path d="m10 9 5 3-5 3z" /></I>
+export const Play = (p: P) => <I {...p}><path d="m7 4 13 8-13 8z" /></I>
+export const Download = (p: P) => <I {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" /></I>
+export const Up = (p: P) => <I {...p}><path d="m18 15-6-6-6 6" /></I>
 export const Undo = (p: P) => <I {...p}><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-15-6.7L3 13" /></I>
 
 export const XLogo = ({ size = 16 }: { size?: number }) => (

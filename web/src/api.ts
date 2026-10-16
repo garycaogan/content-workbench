@@ -55,7 +55,28 @@ export type Draft = {
   feishu_error?: string | null; feishu_synced_at?: number | null; feishu_synced_version?: number | null
   last_revision?: string | null
   xhs?: XhsState
+  video?: VideoState
 }
+export type VideoItem = { text?: string; sub?: string; cue?: string; accent?: string }
+export type VideoRow = { label?: string; before?: string; after?: string; cue?: string }
+export type VideoScene = {
+  type: 'hook' | 'points' | 'shot' | 'stat' | 'change' | 'quote' | 'cta'; say: string
+  eyebrow?: string; title?: string; accent?: string; title2?: string; accent2?: string
+  lead?: string; sub?: string; words?: string[]; chips?: VideoItem[]; box?: string
+  items?: VideoItem[]; footer?: string; footer_accent?: string
+  image?: number; focus?: number[]; label?: string; badges?: VideoItem[]
+  value?: string; unit?: string; then?: string; then_unit?: string
+  rows?: VideoRow[]; lines?: string[]; lines_cue?: string[]
+  badge?: string; command?: string; sign?: string; sign_sub?: string
+  [cue: `${string}_cue`]: string | string[] | undefined
+}
+export type VideoState = {
+  scenes?: VideoScene[]; voice?: string; bgm?: boolean; status?: '' | 'planning' | 'rendering'; stage?: string; pct?: number
+  error?: string | null; planned_at?: number; edited_at?: number
+  video?: { duration: number; size: number; rendered_at: number; scenes: { start: number; duration: number }[] }
+}
+export type VideoOptions = { voices: { id: string; name: string; desc: string }[]; default_voice: string; tts: boolean
+  whisper: boolean; bgm: boolean; types: Record<string, string> }
 export type XhsCover = { kicker?: string; lines?: string[]; highlight?: string; subtitle?: string; pills?: string[] }
 export type XhsCard = { title?: string; points?: string[] }
 export type XhsState = { title?: string; body?: string; tags?: string[]; cover?: XhsCover; cards?: XhsCard[]

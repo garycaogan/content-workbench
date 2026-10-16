@@ -56,7 +56,8 @@ WORKERS = 3
 
 def _claim(allow_heavy: bool) -> dict | None:
     with db.tx() as conn:
-        kinds = "" if allow_heavy else "AND kind != 'transcribe'"
+        # Whisper and video rendering use this machine's GPU/CPU: one at a time, on one worker
+        kinds = "" if allow_heavy else "AND kind NOT IN ('transcribe', 'video_render')"
         job = conn.execute(f"SELECT * FROM jobs WHERE state='queued' {kinds} ORDER BY id LIMIT 1").fetchone()
         if not job:
             return None
@@ -98,6 +99,13 @@ def _mark_failure(kind: str, payload: dict, exc: Exception) -> None:
             xhs.save(payload["draft_id"], state)
         elif kind == "revise":
             conn.execute("UPDATE drafts SET status='draft', error=? WHERE id=?", (f"按批注修改失败：{exc}"[:500], payload["draft_id"]))
+        elif kind in ("video_plan", "video_render"):
+            from . import video
+            d = db.row("SELECT video FROM drafts WHERE id=?", (payload["draft_id"],))
+            state = video.load(d or {})
+            what = "写视频脚本" if kind == "video_plan" else "出片"
+            state.update(status="", stage="", error=f"{what}失败：{exc}"[:400])
+            conn.execute("UPDATE drafts SET video=? WHERE id=?", (json.dumps(state, ensure_ascii=False), payload["draft_id"]))
         elif kind == "import_feishu":
             failed = library_state().get("failed", {})
             failed[payload["token"]] = str(exc)[:200]
@@ -125,6 +133,12 @@ def run_job(settings: Settings, kind: str, payload: dict) -> None:
         comments.revise(settings, payload["draft_id"])
     elif kind == "learn":
         learning.learn()
+    elif kind == "video_plan":
+        from . import video
+        video.plan(settings, payload["draft_id"])
+    elif kind == "video_render":
+        from . import video
+        video.render(settings, payload["draft_id"])
     elif kind == "xhs":
         from . import xhs
         try:
@@ -148,6 +162,7 @@ def _transcribe(payload: dict) -> None:
 
 
 CHUNK = 36000
+EXISTING_IDEAS = 400  # most recent idea titles shown to the extractor
 
 
 def _chunks(text: str) -> list[str]:
@@ -173,11 +188,15 @@ def _extract(settings: Settings, payload: dict) -> None:
     body = material["body"]
     ideas = []
     pieces = _chunks(body)
+    # the same talk often arrives as a transcript, a doc and a rewrite: show the
+    # model what is already there so one point doesn't become three ideas
+    existing = [r["title"] for r in db.rows("SELECT title FROM ideas ORDER BY id DESC LIMIT ?", (EXISTING_IDEAS,))]
     for n, piece in enumerate(pieces, 1):
         part = dict(material, body=piece)
         if len(pieces) > 1:
             part["title"] = f"{material['title']}（第 {n}/{len(pieces)} 段）"
-        data = llm.extract_json(llm.run(prompts.build_extract(settings, part)))
+        found = [str(i.get("title", "")) for i in ideas if isinstance(i, dict)]
+        data = llm.extract_json(llm.run(prompts.build_extract(settings, part, found + existing)))
         ideas += data.get("ideas", []) if isinstance(data, dict) else data
     with db.tx() as conn:
         for idea in ideas[:8 * len(pieces)]:

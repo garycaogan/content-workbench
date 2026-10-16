@@ -668,3 +668,47 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .xhs-tile.add:hover { opacity: 1; outline: 2px solid var(--accent); }
 .tile-acts { position: absolute; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: center; background: rgba(0, 0, 0, .55); color: #fff; font-size: 11px; padding: 2px 4px; }
 .tile-acts button { border: none; background: none; color: #fff; cursor: pointer; font-size: 15px; padding: 0 6px; }
+
+/* ---------------------------------------------------------------- 视频 */
+.video { gap: 12px; }
+.vnote { display: flex; gap: 6px; align-items: flex-start; padding: 8px 10px; border-radius: var(--r-md); background: var(--info-soft); color: var(--info); }
+.vnote.warn { background: var(--warn-soft); color: var(--warn); }
+.vprogress { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface); }
+.vprogress .row span { display: inline-flex; align-items: center; gap: 6px; }
+.vbar { height: 6px; border-radius: 100px; background: var(--accent-soft); overflow: hidden; }
+.vbar i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .6s ease; }
+.vresult { display: grid; grid-template-columns: minmax(0, 168px) minmax(0, 1fr); gap: 12px; align-items: start; }
+.vplayer { width: 100%; aspect-ratio: 9 / 16; border-radius: var(--r-lg); background: #000; display: block; }
+.vresult-side { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.vresult-side .btn { justify-content: center; }
+.vbar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding-top: 4px; border-top: 1px solid var(--border); }
+.vbar-head b { font-weight: 600; }
+.input.sm { height: 28px; padding: 0 8px; font-size: 12.5px; width: auto; }
+.vcheck { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); cursor: pointer; }
+.vscenes { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.vscene { border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface); overflow: hidden; }
+.vscene.open { border-color: var(--border-strong); box-shadow: var(--shadow-xs); }
+.vscene-head { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%;
+  padding: 9px 10px; background: none; border: 0; text-align: left; cursor: pointer; font: inherit; color: inherit; }
+.vscene-head:hover { background: var(--surface-2); }
+.vnum { width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; background: var(--accent-soft); color: var(--accent-text); font-size: 11px; font-weight: 700; }
+.vtype { font-size: 11.5px; font-weight: 600; color: var(--muted); white-space: nowrap; }
+.vsay { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vsec { font-variant-numeric: tabular-nums; }
+.vscene-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 12px 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+.vfield { display: flex; flex-direction: column; gap: 5px; }
+.vfield > span { font-size: 12px; color: var(--muted); font-weight: 500; }
+.vfield > span em { font-style: normal; color: var(--faint); font-weight: 400; margin-left: 6px; }
+.vsay-input { font-size: 14px; line-height: 1.7; min-height: 64px; }
+.vgrid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.vthumbs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.vthumb { padding: 0; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--surface-2); aspect-ratio: 4 / 3; cursor: pointer; }
+.vthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.vthumb.on { outline: 2px solid var(--accent); outline-offset: 1px; }
+.vfocus { position: relative; border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); cursor: crosshair; touch-action: none; user-select: none; max-height: 420px; }
+.vfocus img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+.vfocus-box { position: absolute; border: 2.5px solid var(--accent); border-radius: 6px; box-shadow: 0 0 0 9999px rgba(15, 20, 25, .35); pointer-events: none; }
+@media (max-width: 720px) {
+  .vresult { grid-template-columns: minmax(0, 1fr); }
+  .vplayer { max-height: 70vh; width: auto; margin: 0 auto; }
+}

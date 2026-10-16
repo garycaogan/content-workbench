@@ -7,12 +7,13 @@ import { CasesPanel, FeedCard, FeishuLine, MediaPanel, PublishLongform, uploadIm
 import { RichEditor, type Selection } from '../RichEditor'
 import { CommentsPanel, DiffDialog, waiting } from './Comments'
 import { XhsPanel } from './Xhs'
+import { VideoPanel } from './Video'
 import { locate, type Anchor } from '../commentAnchors'
 import type { Editor as TiptapEditor } from '@tiptap/react'
 
 type Preview = { flags: string[]; thread?: { index: number; text: string; weighted: number; over: boolean }[]; html?: string }
 type Version = { id: number; title: string; body: string; created_at: number; origin: string }
-type SideTab = 'preview' | 'comments' | 'media' | 'xhs' | 'cases' | 'notes' | 'voice' | 'log'
+type SideTab = 'preview' | 'comments' | 'media' | 'xhs' | 'video' | 'cases' | 'notes' | 'voice' | 'log'
 
 const SEP = '\n---\n'
 const SPLIT = /\n[ \t]*-{3,}[ \t]*\n/
@@ -219,7 +220,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
   const flags = preview?.flags || []
   const pubs = draft.publications || []
   const connected = isX ? status?.x_connected : status?.wechat_configured
-  const tabs = ((isX ? ['comments', 'notes', 'cases', 'voice', 'log'] : ['preview', 'comments', 'media', 'xhs', 'cases', 'notes', 'voice', 'log']) as SideTab[])
+  const tabs = ((isX ? ['comments', 'notes', 'cases', 'voice', 'log'] : ['preview', 'comments', 'media', 'xhs', 'video', 'cases', 'notes', 'voice', 'log']) as SideTab[])
     .filter(k => k !== 'cases' || status?.case_search)
   const revising = draft.status === 'revising'
   const todo = waiting(threads)
@@ -303,6 +304,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
                 {k === 'comments' && <><Ic.Note size={15} /> 批注{openCount > 0 && <span className="badge accent">{openCount}</span>}</>}
                 {k === 'media' && <><Ic.Image size={15} /> 封面·配图</>}
                 {k === 'xhs' && <><span className="xhs-mark">红</span> 小红书</>}
+                {k === 'video' && <><Ic.Film size={15} /> 视频{draft.video?.status && <Ic.Loader size={12} />}</>}
                 {k === 'cases' && <><Ic.Bulb size={15} /> 找案例</>}
                 {k === 'notes' && <><Ic.Doc size={15} /> 备注</>}
                 {k === 'voice' && <><Ic.Sparkle size={15} /> 文风{flags.length > 0 && <span className="badge">{flags.length}</span>}</>}
@@ -316,6 +318,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
                 active={activeThread} onActivate={focusThread} onChanged={loadThreads} onRevise={revise} busy={revising} />
             )}
             {tab === 'xhs' && !isX && <XhsPanel draft={draft} onDraft={setDraft} />}
+            {tab === 'video' && !isX && <VideoPanel draft={draft} onDraft={setDraft} />}
             {tab === 'cases' && <CasesPanel draftId={id} onUse={line => setNotes(n => (n.trim() ? n.trimEnd() + '\n' : '') + line)} />}
             {tab === 'preview' && !isX && <FeedCard draft={draft} title={title} summary={summary} body={body} />}
             {tab === 'media' && !isX && (

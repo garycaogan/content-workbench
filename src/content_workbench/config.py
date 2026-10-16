@@ -63,6 +63,12 @@ class Settings:
     # Optional file holding a `claude setup-token` OAuth token. The standalone
     # CLI does not share the desktop app's login, so it needs its own.
     claude_token_file: str = ""
+    # short video (视频 tab): Evolink key file for the Chinese TTS, default voice,
+    # the line under the author mark, and the music bed (default <data>/video/bgm.wav)
+    evolink_key_file: str = ""
+    video_voice: str = ""
+    video_tagline: str = ""
+    video_bgm: str = ""
     # Cloudflare Access in front of a public domain. When access_team is set,
     # every request must carry a valid Access token for access_aud.
     access_team: str = ""
