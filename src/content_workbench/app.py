@@ -811,7 +811,7 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             allowed = {im["id"] for im in images.for_draft(did)}
             state["scenes"] = [video.normalize(s, allowed, keep_type=True) for s in body["scenes"] if isinstance(s, dict)][:16]
             state["edited_at"] = db.now()
-        if body.get("voice") in {v["id"] for v in video.VOICES}:
+        if body.get("voice") in {v["id"] for v in video.voices(settings)}:
             state["voice"] = body["voice"]
         if "bgm" in body:
             state["bgm"] = bool(body["bgm"])
@@ -853,7 +853,7 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             raise HTTPException(400, "缺少镜头")
         try:
             return video.preview(settings, did, max(0, int(body.get("index") or 0)), body["scene"],
-                                 last=bool(body.get("last")), speak=bool(body.get("speak")))
+                                 last=bool(body.get("last")), voice_now=bool(body.get("speak")))
         except video.VideoError as exc:
             raise HTTPException(400, str(exc)) from None
 

@@ -183,3 +183,62 @@ def test_scene_preview_plays_in_the_browser_and_speaks_only_when_asked(monkeypat
     p3 = c.post(f"/api/drafts/{did}/video/preview", json={"index": 1, "scene": {**scene, "title": "换个标题"}}, headers=H).json()
     assert p3["voiced"] and p3["url"] != p2["url"] and len(made) == 1
     assert c.post(f"/api/drafts/{did}/video/preview", json={"index": 0, "scene": {"type": "hook", "say": " "}}, headers=H).status_code == 400
+
+
+def test_own_voice_is_cloned_from_a_recording_and_recloned_when_it_expires(monkeypatch, tmp_path):
+    import wave
+    ref = tmp_path / "me.wav"
+    with wave.open(str(ref), "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(16000), w.writeframes(b"\1\0" * 16000)
+    s = Settings(video_clone_ref=str(ref), video_clone_name="我的声音", video_voice="clone")
+    assert [v["id"] for v in video.voices(s)][:2] == ["clone", "longanyang_v3.1"] and video.voices(s)[0]["name"] == "我的声音"
+    assert video.default_voice(s) == "clone" and video.default_voice(Settings(video_voice="clone")) == "longanyang_v3.1"
+    assert video.draft_voice(s, {"voice": "gone"}) == "clone" and video.draft_voice(s, {"voice": "longanlang_v3.1"}) == "longanlang_v3.1"
+
+    uploads, enrolls, said = [], [], []
+    monkeypatch.setattr(video, "_upload", lambda key, path: uploads.append(path) or f"https://files/{len(uploads)}")
+
+    def fake_ev(key, method, path, body=None):
+        enrolls.append(body["audio_url"])
+        return {"id": "t"}
+    monkeypatch.setattr(video, "_ev", fake_ev)
+    monkeypatch.setattr(video, "_task", lambda key, task, what, tries=150: {"result_data": {"voice": f"v{len(enrolls)}"}})
+    assert video.cloned_voice(s, "k") == "v1" and video.cloned_voice(s, "k") == "v1"  # kept while fresh
+    state = video.data_dir() / "video" / "clone.json"
+    st = json.loads(state.read_text())
+    st["voice_at"] -= video.CLONE_TTL + 1
+    state.write_text(json.dumps(st))
+    assert video.cloned_voice(s, "k") == "v2" and uploads == [ref] and enrolls == ["https://files/1"] * 2  # link reused
+
+    # the TTS says the clone has expired before its time: clone again and retry once
+    def fake_synth(key, text, voice, out, language=""):
+        said.append((voice, language))
+        if voice == "v2":
+            raise video.VoiceExpired("expired")
+        out.write_bytes(b"wav")
+    monkeypatch.setattr(video, "synth", fake_synth)
+    video.speak(s, "k", "一句话", "clone", tmp_path / "out.wav")
+    assert said == [("v2", "zh"), ("v3", "zh")] and (tmp_path / "out.wav").read_bytes() == b"wav"
+    video.speak(s, "k", "一句话", "longanlang_v3.1", tmp_path / "p.wav")
+    assert said[-1] == ("longanlang_v3.1", "")
+
+    # the cache follows the recording, not the clone's changing id
+    key1 = video.voice_key(s, "clone")
+    assert key1.startswith("clone-") and video.voice_key(s, "longanlang_v3.1") == "longanlang_v3.1"
+    with wave.open(str(ref), "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(16000), w.writeframes(b"\2\0" * 16000)
+    import os
+    os.utime(ref, (1, 1))
+    assert video.voice_key(s, "clone") != key1
+    assert video.cloned_voice(s, "k") == "v4" and len(uploads) == 2  # a new recording is uploaded and cloned
+
+
+def test_own_voice_is_offered_by_the_api_when_configured(tmp_path):
+    ref = tmp_path / "me.wav"
+    ref.write_bytes(b"RIFF")
+    c = client(video_clone_ref=str(ref), video_voice="clone")
+    login(c)
+    o = c.get("/api/video/options").json()
+    assert o["voices"][0]["id"] == "clone" and o["default_voice"] == "clone"
+    did = new_longform(c)
+    assert c.put(f"/api/drafts/{did}/video", json={"voice": "clone"}, headers=H).json()["voice"] == "clone"

@@ -69,6 +69,10 @@ class Settings:
     video_voice: str = ""
     video_tagline: str = ""
     video_bgm: str = ""
+    # the author's own voice: a recording of them reading (10–60 s, mono WAV) that
+    # Evolink clones; it shows up as a voice ("clone") named video_clone_name
+    video_clone_ref: str = ""
+    video_clone_name: str = ""
     # Cloudflare Access in front of a public domain. When access_team is set,
     # every request must carry a valid Access token for access_aud.
     access_team: str = ""

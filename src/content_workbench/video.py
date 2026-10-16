@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -189,19 +190,134 @@ def _ev(key: str, method: str, path: str, body=None):
     return json.loads(urllib.request.urlopen(req, timeout=60).read())
 
 
-def synth(key: str, text: str, voice: str, out: Path) -> None:
-    task = _ev(key, "POST", "/audios/generations",
-               {"model": TTS_MODEL, "prompt": text, "voice": voice, "instruction": INSTRUCTION, "response_format": "wav"})
-    for _ in range(150):
+class VoiceExpired(VideoError):
+    pass
+
+
+def _task(key: str, task: dict, what: str, tries: int = 150) -> dict:
+    st = task
+    for _ in range(tries):
         time.sleep(2)
         st = _ev(key, "GET", f"/tasks/{task['id']}")
         if st.get("status") in ("completed", "failed", "cancelled"):
             break
     if st.get("status") != "completed":
-        raise VideoError(f"配音失败：{json.dumps(st.get('error'), ensure_ascii=False)[:200]}")
+        err = json.dumps(st.get("error"), ensure_ascii=False)[:200]
+        raise (VoiceExpired if "expired" in err else VideoError)(f"{what}失败：{err}")
+    return st
+
+
+def synth(key: str, text: str, voice: str, out: Path, language: str = "") -> None:
+    body = {"model": TTS_MODEL, "prompt": text, "voice": voice, "instruction": INSTRUCTION, "response_format": "wav"}
+    if language:
+        body["language"] = language
+    try:
+        task = _ev(key, "POST", "/audios/generations", body)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        raise (VoiceExpired if exc.code == 404 or "expired" in detail else VideoError)(f"配音失败：{exc.code} {detail}") from None
+    st = _task(key, task, "配音")
     url = st["results"][0]
     url = url if isinstance(url, str) else url["url"]
     out.write_bytes(urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=120).read())
+
+
+# ------------------------------------------------------------------ the author's own voice
+#
+# Evolink clones a voice from one recording (voice-enrollment). A cloned voice
+# lives 6 hours and using it does not renew it, so the settings keep the
+# recording, not the voice: the current voice id is kept beside the data with
+# its age and cloned again when it is about to expire or the TTS says it has.
+# Cloning takes a public link to the recording; an uploaded file lives 72 hours
+# and is reused for re-cloning until then, so the recording is uploaded rarely.
+
+CLONE = "clone"
+CLONE_TTL = 5.5 * 3600
+UPLOAD_TTL = 70 * 3600
+_CLONE_LOCK = threading.Lock()
+_digests: dict[tuple, str] = {}
+
+
+def clone_ref(settings: Settings) -> Path | None:
+    path = Path(settings.video_clone_ref).expanduser() if settings.video_clone_ref else None
+    return path if path and path.is_file() else None
+
+
+def _digest(path: Path) -> str:
+    st = path.stat()
+    k = (str(path), st.st_mtime, st.st_size)
+    if k not in _digests:
+        _digests[k] = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+    return _digests[k]
+
+
+def voice_key(settings: Settings, voice: str) -> str:
+    """What the voice cache is keyed on: the preset's id, or for the cloned voice
+    the recording itself (the clone's id changes every few hours, the voice doesn't)."""
+    if voice != CLONE:
+        return voice
+    ref = clone_ref(settings)
+    return f"clone-{_digest(ref)}" if ref else CLONE
+
+
+def _upload(key: str, path: Path) -> str:
+    import httpx
+    with path.open("rb") as fh:
+        r = httpx.post("https://files-api.evolink.ai/api/v1/files/upload/stream", headers={"Authorization": "Bearer " + key, **UA},
+                       files={"file": (f"ref{path.suffix}", fh, "audio/wav")}, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+    url = (data.get("data") or data).get("file_url")
+    if not url:
+        raise VideoError("上传参考录音失败：" + json.dumps(data, ensure_ascii=False)[:200])
+    return url
+
+
+def cloned_voice(settings: Settings, key: str, fresh: bool = False) -> str:
+    """The provider's id for the author's cloned voice, cloning again when needed."""
+    ref = clone_ref(settings)
+    if not ref:
+        raise VideoError("还没配置复刻音色用的录音（设置里的 video_clone_ref）")
+    path = data_dir() / "video" / "clone.json"
+    digest = _digest(ref)
+    with _CLONE_LOCK:
+        st = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if st.get("digest") != digest:
+            st = {"digest": digest}
+        now = time.time()
+        if not fresh and st.get("voice") and now - st.get("voice_at", 0) < CLONE_TTL:
+            return st["voice"]
+        if not st.get("url") or now - st.get("url_at", 0) > UPLOAD_TTL:
+            st.update(url=_upload(key, ref), url_at=now)
+        task = _ev(key, "POST", "/audios/generations",
+                   {"model": "voice-enrollment", "audio_url": st["url"], "preferred_name": "workbench", "language": "zh"})
+        voice = (_task(key, task, "复刻音色", tries=60).get("result_data") or {}).get("voice")
+        if not voice:
+            raise VideoError("复刻音色失败：没有拿到音色")
+        st.update(voice=voice, voice_at=time.time())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(st), encoding="utf-8")
+        return voice
+
+
+def speak(settings: Settings, key: str, text: str, voice: str, out: Path) -> None:
+    """One line in the chosen voice: a preset, or the author's cloned voice."""
+    if voice != CLONE:
+        return synth(key, text, voice, out)
+    try:
+        synth(key, text, cloned_voice(settings, key), out, language="zh")
+    except VoiceExpired:  # expired early: clone once more and retry
+        synth(key, text, cloned_voice(settings, key, fresh=True), out, language="zh")
+
+
+def voices(settings: Settings) -> list[dict]:
+    mine = [{"id": CLONE, "name": settings.video_clone_name or "我的声音", "desc": "用你自己的录音复刻"}] if clone_ref(settings) else []
+    return mine + VOICES
+
+
+def default_voice(settings: Settings) -> str:
+    ids = {v["id"] for v in voices(settings)}
+    return settings.video_voice if settings.video_voice in ids else VOICES[0]["id"]
 
 
 def tool_env() -> dict:
@@ -616,6 +732,11 @@ def _image_for(scene: dict, assets: Path) -> dict | None:
     return {"src": f"assets/{name}", "w": image["width"], "h": image["height"]}
 
 
+def draft_voice(settings: Settings, state: dict) -> str:
+    picked = state.get("voice")
+    return picked if picked in {v["id"] for v in voices(settings)} else default_voice(settings)
+
+
 def voice_cache(voice: str, spoken: str) -> Path:
     """Where the voice for this exact line and voice is kept (render and preview share it)."""
     cache = data_dir() / "video-cache"
@@ -645,7 +766,7 @@ def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], 
     if not scenes:
         raise VideoError("脚本是空的")
     key = evolink_key(settings)
-    voice = state.get("voice") or settings.video_voice or VOICES[0]["id"]
+    voice = draft_voice(settings, state)
     root = work_dir(draft_id)
     shutil.rmtree(root, ignore_errors=True)
     assets = root / "assets"
@@ -656,12 +777,12 @@ def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], 
     todo = []
     for scene in scenes:
         spoken, segs = speakable(scene["say"])
-        todo.append((spoken, segs, voice_cache(voice, spoken)))
+        todo.append((spoken, segs, voice_cache(voice_key(settings, voice), spoken)))
     missing = [(spoken, raw) for spoken, _segs, raw in todo if not raw.exists()]
     done = len(todo) - len(missing)
     _progress(draft_id, f"配音 {done}/{len(todo)}", 5)
     with ThreadPoolExecutor(4) as pool:
-        for _ in pool.map(lambda job: synth(key, job[0], voice, job[1]), missing):
+        for _ in pool.map(lambda job: speak(settings, key, job[0], voice, job[1]), missing):
             done += 1
             _progress(draft_id, f"配音 {done}/{len(todo)}", int(5 + 25 * done / len(todo)))
 
@@ -752,12 +873,12 @@ def preview_dir(draft_id: int) -> Path:
     return data_dir() / "video-preview" / f"draft-{draft_id}"
 
 
-def preview(settings: Settings, draft_id: int, index: int, scene: dict, last: bool = False, speak: bool = False) -> dict:
+def preview(settings: Settings, draft_id: int, index: int, scene: dict, last: bool = False, voice_now: bool = False) -> dict:
     """One scene as a page the browser plays: the composition, captions and author
     mark the render uses, without encoding anything. The page only seeks; the
     editor plays the voice and drives the picture from it.
 
-    The voice is made only when asked (speak) and is cached by text, so editing a
+    The voice is made only when asked (voice_now) and is cached by text, so editing a
     line costs nothing until you listen; until then the timing is estimated and
     the preview is silent. A preview is kept under a hash of what it shows, so
     flipping back to an earlier version is instant."""
@@ -768,14 +889,14 @@ def preview(settings: Settings, draft_id: int, index: int, scene: dict, last: bo
     s = normalize(scene, {im["id"] for im in images.for_draft(draft_id)}, keep_type=True)
     if not s["say"].strip():
         raise VideoError("这个镜头还没写口播")
-    voice = state.get("voice") or settings.video_voice or VOICES[0]["id"]
+    voice = draft_voice(settings, state)
     spoken, segs = speakable(s["say"])
-    raw = voice_cache(voice, spoken)
-    if speak and not raw.exists():
-        synth(evolink_key(settings), spoken, voice, raw)
+    raw = voice_cache(voice_key(settings, voice), spoken)
+    if voice_now and not raw.exists():
+        speak(settings, evolink_key(settings), spoken, voice, raw)
     voiced = raw.exists()
     author = settings.author or prompts.persona(settings)["name"]
-    key = hashlib.sha1(json.dumps([s, voice, voiced, index, last, author, settings.video_tagline, _PREVIEW_CODE], ensure_ascii=False,
+    key = hashlib.sha1(json.dumps([s, voice_key(settings, voice), voiced, index, last, author, settings.video_tagline, _PREVIEW_CODE], ensure_ascii=False,
                                   sort_keys=True).encode()).hexdigest()[:12]
     base = preview_dir(draft_id)
     root = base / key
@@ -845,6 +966,6 @@ def overview() -> list[dict]:
 
 def options(settings: Settings) -> dict:
     key_ok = bool(settings.evolink_key_file and Path(settings.evolink_key_file).expanduser().is_file())
-    return {"voices": VOICES, "default_voice": settings.video_voice or VOICES[0]["id"], "tts": key_ok,
+    return {"voices": voices(settings), "default_voice": default_voice(settings), "tts": key_ok,
             "whisper": whisper_available(), "types": TYPE_NAMES,
             "bgm": bool((Path(settings.video_bgm).expanduser() if settings.video_bgm else data_dir() / "video" / "bgm.wav").is_file())}
