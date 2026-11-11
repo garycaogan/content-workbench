@@ -2,18 +2,21 @@ import { useEffect, useRef } from 'react'
 import { useEditor, EditorContent, useEditorState, type Editor as TiptapEditor } from '@tiptap/react'
 import { BubbleMenu } from '@tiptap/react/menus'
 import { anchorKey, CommentAnchors, type Anchor } from './commentAnchors'
+import { Clip, isVideoFile } from './ClipNode'
 import StarterKit from '@tiptap/starter-kit'
 import Highlight from '@tiptap/extension-highlight'
 import Image from '@tiptap/extension-image'
 import Placeholder from '@tiptap/extension-placeholder'
+import { TableKit } from '@tiptap/extension-table'
 import MarkdownIt from 'markdown-it'
 import markPlugin from 'markdown-it-mark'
-import type { JSONContent } from '@tiptap/core'
+import type { AnyExtension, JSONContent } from '@tiptap/core'
 import * as Ic from './icons'
 
-/* The draft is stored as Markdown (## 标题, **加粗**, ==高亮==, ![](/api/images/N)).
-   The editor shows it as formatted text with the pictures in place and writes
-   Markdown back on every change. */
+/* The draft is stored as Markdown (## 标题, **加粗**, ==高亮==, ![](/api/images/N),
+   videos as ![](/api/clips/N), tables as | 列 | 列 |). The editor shows it as
+   formatted text with the pictures and videos in place and writes Markdown back
+   on every change. */
 
 const md = new MarkdownIt('commonmark', { html: false, linkify: false }).enable('table').use(markPlugin)
 
@@ -133,10 +136,43 @@ function block(node: JSONContent, indent = ''): string {
       }).join('\n')
     }
     case 'horizontalRule': return '---'
-    case 'image': return `![${String(node.attrs?.alt || '')}](${String(node.attrs?.src || '')})`
+    case 'image':
+    case 'clip': return `![${String(node.attrs?.alt || '')}](${String(node.attrs?.src || '')})`
     case 'codeBlock': return '```' + String(node.attrs?.language || '') + '\n' + kids.map(k => k.text || '').join('') + '\n```'
+    case 'table': return table(node)
     default: return inline(kids)
   }
+}
+
+/* A Markdown cell is one line, so its paragraphs and line breaks become spaces;
+   a | in it is escaped (markdown-it drops the backslash before splitting cells,
+   code spans included). */
+function cellText(node: JSONContent): string {
+  return (node.content || []).map(k => {
+    if (k.type === 'paragraph' || k.type === 'heading')
+      return inline((k.content || []).map(n => (n.type === 'hardBreak' ? { type: 'text', text: ' ' } : n)))
+    if (k.type === 'image' || k.type === 'clip') return block(k)
+    if (k.type === 'text') return escapeText(k.text || '')
+    return cellText(k)  // a list, quote or code block inside a cell keeps only its text
+  }).filter(Boolean).join(' ')
+}
+
+function cell(node: JSONContent): string {
+  return cellText(node).replace(/\n/g, ' ').replace(/\|/g, '\\|').trim()
+}
+
+const RULE: Record<string, string> = { left: ':---', center: ':---:', right: '---:' }
+
+function table(node: JSONContent): string {
+  // the first row is the header, as in Markdown; a merged cell keeps its columns
+  const rows = (node.content || []).map(row => (row.content || []).flatMap(c =>
+    [{ text: cell(c), align: String(c.attrs?.align || '') },
+      ...Array.from({ length: Math.max(0, Number(c.attrs?.colspan || 1) - 1) }, () => ({ text: '', align: '' }))]))
+  if (!rows.length) return ''
+  const cols = Math.max(1, ...rows.map(r => r.length))
+  const line = (r: { text: string }[]) => '| ' + Array.from({ length: cols }, (_, i) => r[i]?.text || '').join(' | ') + ' |'
+  const rule = '|' + Array.from({ length: cols }, (_, i) => RULE[rows[0][i]?.align] || '---').join('|') + '|'
+  return [line(rows[0]), rule, ...rows.slice(1).map(line)].join('\n')
 }
 
 export function docToMarkdown(doc: JSONContent): string {
@@ -147,10 +183,28 @@ export function docToMarkdown(doc: JSONContent): string {
 
 export type Selection = { quote: string; prefix: string; suffix: string }
 
-export function RichEditor({ value, onChange, onFiles, placeholder, editorRef, anchors, activeAnchor, onAnchorClick, onComment, editable = true }: {
+/** The body's schema; the round-trip test parses with exactly this. */
+export function bodyExtensions(placeholder?: string,
+  onAnchorClick: React.MutableRefObject<(id: number) => void> = { current: () => {} }): AnyExtension[] {
+  return [
+    StarterKit.configure({ heading: { levels: [2, 3, 4] }, underline: false, strike: false,
+      link: { openOnClick: false, autolink: true } }),
+    Highlight.configure({ multicolor: false }),
+    Image.configure({ inline: false, allowBase64: false }),
+    Clip,
+    // fixed columns: a Markdown table has no widths to keep
+    TableKit.configure({ table: { resizable: false } }),
+    Placeholder.configure({ placeholder: placeholder || '从这里开始写' }),
+    CommentAnchors.configure({ onClick: onAnchorClick }),
+  ]
+}
+
+export function RichEditor({ value, onChange, onFiles, onClips, placeholder, editorRef, anchors, activeAnchor, onAnchorClick, onComment, editable = true }: {
   value: string
   onChange: (markdown: string) => void
   onFiles: (files: File[]) => Promise<number[]>
+  /** Upload videos; resolves to their clip ids once uploaded (they may still be processing). */
+  onClips?: (files: File[]) => Promise<number[]>
   placeholder?: string
   editorRef?: React.MutableRefObject<TiptapEditor | null>
   anchors?: Anchor[]
@@ -162,31 +216,26 @@ export function RichEditor({ value, onChange, onFiles, placeholder, editorRef, a
   const lastEmitted = useRef(value)
   const onFilesRef = useRef(onFiles)
   onFilesRef.current = onFiles
+  const onClipsRef = useRef(onClips)
+  onClipsRef.current = onClips
   const clickRef = useRef<(id: number) => void>(() => {})
   clickRef.current = id => onAnchorClick?.(id)
 
   const editor = useEditor({
-    extensions: [
-      StarterKit.configure({ heading: { levels: [2, 3, 4] }, underline: false, strike: false,
-        link: { openOnClick: false, autolink: true } }),
-      Highlight.configure({ multicolor: false }),
-      Image.configure({ inline: false, allowBase64: false }),
-      Placeholder.configure({ placeholder: placeholder || '从这里开始写' }),
-      CommentAnchors.configure({ onClick: clickRef }),
-    ],
+    extensions: bodyExtensions(placeholder, clickRef),
     editable,
     content: markdownToHtml(value),
     editorProps: {
       attributes: { class: 'rich-body', spellcheck: 'false' },
       handlePaste: (view, event) => {
-        const files = [...(event.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'))
+        const files = [...(event.clipboardData?.files || [])].filter(f => f.type.startsWith('image/') || isVideoFile(f))
         if (!files.length) return false
         event.preventDefault()
         insertUploaded(view.state.selection.from, files)
         return true
       },
       handleDrop: (view, event) => {
-        const files = [...(event.dataTransfer?.files || [])].filter(f => f.type.startsWith('image/'))
+        const files = [...(event.dataTransfer?.files || [])].filter(f => f.type.startsWith('image/') || isVideoFile(f))
         if (!files.length) return false
         event.preventDefault()
         const pos = view.posAtCoords({ left: event.clientX, top: event.clientY })?.pos ?? view.state.selection.from
@@ -202,9 +251,18 @@ export function RichEditor({ value, onChange, onFiles, placeholder, editorRef, a
   })
 
   async function insertUploaded(pos: number, files: File[]) {
-    const ids = await onFilesRef.current(files)
-    if (!editor || !ids.length) return
-    editor.chain().focus().insertContentAt(pos, ids.map(id => ({ type: 'image', attrs: { src: `/api/images/${id}` } }))).run()
+    const videos = files.filter(isVideoFile)
+    const pics = files.filter(f => !isVideoFile(f))
+    const ids = pics.length ? await onFilesRef.current(pics) : []
+    if (editor && ids.length) {
+      editor.chain().focus().insertContentAt(pos, ids.map(id => ({ type: 'image', attrs: { src: `/api/images/${id}` } }))).run()
+      pos += ids.length  // each picture is one atom
+    }
+    const clips = videos.length && onClipsRef.current ? await onClipsRef.current(videos) : []
+    if (editor && clips.length) {
+      editor.chain().focus().insertContentAt(Math.min(pos, editor.state.doc.content.size),
+        clips.map(id => ({ type: 'clip', attrs: { src: `/api/clips/${id}` } }))).run()
+    }
   }
 
   // outside changes (restore a version, AI draft arriving) replace the content
@@ -235,8 +293,8 @@ export function RichEditor({ value, onChange, onFiles, placeholder, editorRef, a
   if (!editor) return null
   return (
     <div className="rich">
-      {editable && <Toolbar editor={editor} onPick={files => insertUploaded(editor.state.selection.from, files)} />}
-      <BubbleMenu editor={editor} className="bubble" shouldShow={({ editor: e, from, to }) => from !== to && !e.isActive('image')}>
+      {editable && <Toolbar editor={editor} videos={!!onClips} onPick={files => insertUploaded(editor.state.selection.from, files)} />}
+      <BubbleMenu editor={editor} className="bubble" shouldShow={({ editor: e, from, to }) => from !== to && !e.isActive('image') && !e.isActive('clip')}>
         {editable && <>
           <button type="button" onMouseDown={e => e.preventDefault()} onClick={() => editor.chain().focus().toggleBold().run()} aria-label="加粗"><b>B</b></button>
           <button type="button" onMouseDown={e => e.preventDefault()} onClick={() => editor.chain().focus().toggleHighlight().run()} aria-label="高亮"><span className="hl">高亮</span></button>
@@ -249,14 +307,15 @@ export function RichEditor({ value, onChange, onFiles, placeholder, editorRef, a
   )
 }
 
-function Toolbar({ editor, onPick }: { editor: TiptapEditor; onPick: (files: File[]) => void }) {
+function Toolbar({ editor, videos, onPick }: { editor: TiptapEditor; videos: boolean; onPick: (files: File[]) => void }) {
   const fileRef = useRef<HTMLInputElement>(null)
+  const videoRef = useRef<HTMLInputElement>(null)
   const s = useEditorState({
     editor,
     selector: ({ editor: e }) => ({
       h2: e.isActive('heading', { level: 2 }), h3: e.isActive('heading', { level: 3 }), h4: e.isActive('heading', { level: 4 }),
       bold: e.isActive('bold'), mark: e.isActive('highlight'), quote: e.isActive('blockquote'),
-      ul: e.isActive('bulletList'), ol: e.isActive('orderedList'),
+      ul: e.isActive('bulletList'), ol: e.isActive('orderedList'), table: e.isActive('table'),
       undo: e.can().undo(), redo: e.can().redo(),
     }),
   })
@@ -279,9 +338,23 @@ function Toolbar({ editor, onPick }: { editor: TiptapEditor; onPick: (files: Fil
       <B label="无序列表" on={s.ul} run={() => c().toggleBulletList().run()}>• 列表</B>
       <B label="有序列表" on={s.ol} run={() => c().toggleOrderedList().run()}>1. 列表</B>
       <B label="分割线" run={() => c().setHorizontalRule().run()}>—</B>
+      <B label="插入表格" title="插入表格（Tab 跳到下一格）" on={s.table}
+        run={() => { if (!s.table) c().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run() }}>表格</B>
+      {s.table && <>
+        <B label="在下面加一行" run={() => c().addRowAfter().run()}>+行</B>
+        <B label="在右边加一列" run={() => c().addColumnAfter().run()}>+列</B>
+        <B label="删掉这一行" run={() => c().deleteRow().run()}>−行</B>
+        <B label="删掉这一列" run={() => c().deleteColumn().run()}>−列</B>
+        <B label="删掉整个表格" run={() => c().deleteTable().run()}>删表格</B>
+      </>}
       <B label="插入图片" run={() => fileRef.current?.click()}><Ic.Image size={15} /></B>
       <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden
         onChange={e => { onPick([...(e.target.files || [])]); e.target.value = '' }} />
+      {videos && <>
+        <B label="插入视频" title="插入视频（推到 X 长文时是能播放的视频）" run={() => videoRef.current?.click()}><Ic.Film size={15} /></B>
+        <input ref={videoRef} type="file" accept="video/*,.mov,.m4v,.mkv" hidden
+          onChange={e => { onPick([...(e.target.files || [])]); e.target.value = '' }} />
+      </>}
       <span className="sep" />
       <B label="撤销" run={() => c().undo().run()}><Ic.Undo size={15} /></B>
       <B label="重做" run={() => c().redo().run()}><span style={{ display: 'inline-flex', transform: 'scaleX(-1)' }}><Ic.Undo size={15} /></span></B>

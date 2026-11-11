@@ -12,7 +12,7 @@ import difflib
 import json
 import re
 
-from . import db, images, llm, prompts
+from . import clips, db, images, llm, prompts
 from .textutil import normalize_emphasis
 
 PLACEHOLDER = re.compile(r"【([^】\n]{1,300})】")
@@ -115,9 +115,10 @@ def revise(settings, draft_id: int) -> dict:
     if not new_body:
         raise RevisionRejected("AI 没有返回改好的正文")
     lost = [i for i in images.referenced(draft["body"]) if i not in images.referenced(new_body)]
+    lost += [f"clip{c}" for c in clips.referenced(draft["body"]) if c not in clips.referenced(new_body)]
     asked_to_drop = any("删" in t["body"] or any("删" in r["body"] for r in t["replies"]) for t in todo)
     if lost and not asked_to_drop:
-        raise RevisionRejected("AI 改稿时弄丢了正文里的图片，这一轮没有采用，原稿没动，可以再发一次")
+        raise RevisionRejected("AI 改稿时弄丢了正文里的图片或视频，这一轮没有采用，原稿没动，可以再发一次")
     new_body = normalize_emphasis(PLACEHOLDER.sub("", new_body)) + "\n"
     from .learning import record_round
     record_round(draft_id, draft["body"], "before-ai")  # what the author did by hand before handing over

@@ -4,7 +4,8 @@ Each draft owns exactly one docx. A sync rewrites that document (Feishu keeps
 the revision history, so every earlier version stays visible there); it never
 creates a second copy. Pictures go in with ``docs +media-insert``, which only
 appends at the end, so the document is rebuilt in order: overwrite with the
-first stretch of text, then picture, text, picture… If the document's revision
+first stretch of text, then picture, text, picture… A video in the body goes in
+the same way as a file block that Feishu shows as a player. If the document's revision
 moved since our last sync, someone edited it in Feishu and the sync stops
 instead of overwriting, until the author chooses to overwrite."""
 
@@ -12,16 +13,20 @@ from __future__ import annotations
 
 import html
 import json
+import os
+import re
 import tempfile
 import threading
 from pathlib import Path
 
-from . import db, images
+from . import clips, db, images
 from .config import _write_private, data_dir
 from .sources import SourceError, _lark
 from .textutil import markdown_parser
 
 FOLDER_NAME = "内容工作台 · 文章"
+# every sync uploads the body's videos again; past this a video stays a still frame plus a line
+CLIP_MAX = 200 * 1024 * 1024
 _md = markdown_parser()
 _locks: dict[int, threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -88,15 +93,22 @@ def _inline(children) -> str:
     return "".join(out)
 
 
+def _trim(xml: str) -> str:
+    """Drop the line breaks a picture leaves on either side of the text around it."""
+    return re.sub(r"^(?:\s|<br/>)+|(?:\s|<br/>)+$", "", xml)
+
+
 def segments(markdown: str) -> list[tuple[str, object]]:
-    """[("xml", str) | ("image", image_id)] in document order. Pictures that sit
-    in their own paragraph (how the editor inserts them) become real images;
-    anything else stays text."""
+    """[("xml", str) | ("image", image_id) | ("clip", clip_id)] in document order.
+    Every picture or video uploaded through the workbench becomes a real one,
+    wherever it sits; other pictures stay text. Pictures only go in between blocks, so one inside a list
+    or a quote closes the open containers and they reopen for what follows (a
+    numbered list starts counting again after the picture)."""
     tokens = _md.parse(markdown.replace("\r\n", "\n"))
-    lines = markdown.replace("\r\n", "\n").split("\n")
     segs: list[tuple[str, object]] = []
     buf: list[str] = []
-    stack: list[str] = []          # open container tags
+    stack: list[str] = []          # containers we are in (ul/ol/blockquote/li), outermost first
+    opened = 0                     # how many of them are open in buf; a picture closes them all
     i = 0
 
     def flush():
@@ -104,64 +116,79 @@ def segments(markdown: str) -> list[tuple[str, object]]:
             segs.append(("xml", "".join(buf)))
             buf.clear()
 
+    def emit(xml: str) -> None:
+        """Add a block, first reopening the containers a picture closed."""
+        nonlocal opened
+        buf.extend(f"<{tag}>" for tag in stack[opened:])
+        opened = len(stack)
+        buf.append(xml)
+
+    def close() -> None:
+        nonlocal opened
+        if opened == len(stack):
+            buf.append(f"</{stack[-1]}>")
+            opened -= 1
+        stack.pop()
+
+    def picture(kind: str, media_id: int) -> None:
+        nonlocal opened
+        buf.extend(f"</{tag}>" for tag in reversed(stack[:opened]))
+        opened = 0
+        flush()
+        segs.append((kind, media_id))
+
     while i < len(tokens):
         tok = tokens[i]
         t = tok.type
         if t == "paragraph_open":
-            inline = tokens[i + 1]
-            kids = inline.children or []
-            pics = [k for k in kids if k.type == "image"]
             hidden = tok.hidden  # tight list item: no <p>
-            if pics and not stack:
-                part: list = []
-                for k in kids:
-                    m = images.REF_RE.fullmatch(str(k.attrGet("src") or "")) if k.type == "image" else None
-                    if m:
-                        text = _inline(part).strip()
-                        if text and text != "<br/>":
-                            buf.append(f"<p>{text}</p>")
-                        flush()
-                        segs.append(("image", int(m.group(1))))
-                        part = []
-                    else:
-                        part.append(k)
-                text = _inline(part)
-                if text.replace("<br/>", "").strip():
-                    buf.append(f"<p>{text}</p>")
-            else:
-                body = _inline(kids)
-                buf.append(body if hidden else f"<p>{body}</p>")
+            part: list = []
+            split = False
+            for k in tokens[i + 1].children or []:
+                src = str(k.attrGet("src") or "") if k.type == "image" else ""
+                m = images.REF_RE.fullmatch(src) or clips.REF_RE.fullmatch(src)
+                if m:
+                    text = _trim(_inline(part))
+                    if text:
+                        emit(text if hidden else f"<p>{text}</p>")
+                    picture("clip" if src.startswith("/api/clips/") else "image", int(m.group(1)))
+                    part, split = [], True
+                else:
+                    part.append(k)
+            text = _trim(_inline(part)) if split else _inline(part)
+            if text or not split:
+                emit(text if hidden else f"<p>{text}</p>")
             i += 3
             continue
         if t == "heading_open":
             level = min(max(int(tok.tag[1]), 2), 4) if tok.tag != "h1" else 2
-            buf.append(f"<h{level}>{_inline(tokens[i + 1].children)}</h{level}>")
+            emit(f"<h{level}>{_inline(tokens[i + 1].children)}</h{level}>")
             i += 3
             continue
-        if t in ("bullet_list_open", "ordered_list_open", "blockquote_open"):
-            tag = {"bullet_list_open": "ul", "ordered_list_open": "ol", "blockquote_open": "blockquote"}[t]
-            stack.append(tag)
-            buf.append(f"<{tag}>")
-        elif t in ("bullet_list_close", "ordered_list_close", "blockquote_close"):
-            buf.append(f"</{stack.pop()}>")
-        elif t == "list_item_open":
-            buf.append("<li>")
-        elif t == "list_item_close":
-            buf.append("</li>")
+        if t in ("bullet_list_open", "ordered_list_open", "blockquote_open", "list_item_open"):
+            stack.append({"bullet_list_open": "ul", "ordered_list_open": "ol",
+                          "blockquote_open": "blockquote", "list_item_open": "li"}[t])
+        elif t in ("bullet_list_close", "ordered_list_close", "blockquote_close", "list_item_close"):
+            close()
         elif t == "hr":
-            buf.append("<hr/>")
+            emit("<hr/>")
         elif t in ("fence", "code_block"):
-            buf.append(f"<pre><code>{_esc(tok.content.rstrip())}</code></pre>")
+            emit(f"<pre><code>{_esc(tok.content.rstrip())}</code></pre>")
         elif t == "table_open":
-            start, end = tok.map or (0, 0)
-            rows = [r.strip().strip("|").split("|") for r in lines[start:end] if r.strip()]
-            rows = [r for k, r in enumerate(rows) if k != 1]  # drop the --- separator
-            if rows:
-                head = "".join(f"<th>{_esc(c.strip())}</th>" for c in rows[0])
-                body = "".join("<tr>" + "".join(f"<td>{_esc(c.strip())}</td>" for c in r) + "</tr>" for r in rows[1:])
-                buf.append(f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+            # cells from the parser, not the source lines: bold and highlight inside
+            # a cell carry over, and an escaped \| stays in its cell
+            rows: list[list[str]] = []
             while i < len(tokens) and tokens[i].type != "table_close":
+                if tokens[i].type == "tr_open":
+                    rows.append([])
+                elif tokens[i].type in ("th_open", "td_open"):
+                    rows[-1].append(_inline(tokens[i + 1].children))
+                    i += 2  # the cell's inline and close
                 i += 1
+            if rows:
+                head = "".join(f"<th>{c}</th>" for c in rows[0])
+                body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows[1:])
+                emit(f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
         i += 1
     flush()
     return segs
@@ -240,6 +267,26 @@ def _insert_image(doc: str, image_id: int) -> None:
               cwd=Path(tmp), timeout=180)
 
 
+def _insert_clip(doc: str, clip_id: int) -> None:
+    clip = clips.get(clip_id)
+    if not clip or clip["state"] != "ready" or not clips.path_of(clip).is_file():
+        _write(["docs", "+update", "--as", "user", "--doc", doc, "--command", "append"],
+               "<p>[视频还没处理好]</p>" if clip and clip["state"] in ("uploading", "processing") else "<p>[视频已删除]</p>")
+        return
+    stem = re.sub(r"[^\w\u4e00-\u9fff-]+", "", Path(clip["name"]).stem)[:40] or f"video-{clip_id}"
+    with tempfile.TemporaryDirectory(dir=clips.clips_dir()) as tmp:
+        if clip["bytes"] > CLIP_MAX:
+            Path(tmp, f"{stem}.jpg").write_bytes(clips.poster_of(clip).read_bytes())
+            _lark(["docs", "+media-insert", "--as", "user", "--doc", doc, "--file", f"{stem}.jpg", "--align", "center"],
+                  cwd=Path(tmp), timeout=180)
+            _write(["docs", "+update", "--as", "user", "--doc", doc, "--command", "append"],
+                   f"<p>[上面是视频的一帧：{clip['bytes'] // 1024 // 1024}MB，太大没放进飞书，原片在内容工作台里]</p>")
+            return
+        os.link(clips.path_of(clip), Path(tmp, f"{stem}.mp4"))  # same volume: no copy
+        _lark(["docs", "+media-insert", "--as", "user", "--doc", doc, "--file", f"{stem}.mp4", "--type", "file",
+               "--file-view", "preview"], cwd=Path(tmp), timeout=900)
+
+
 def _set(draft_id: int, **fields) -> None:
     cols = ", ".join(f"{k}=?" for k in fields)
     with db.tx() as conn:
@@ -281,6 +328,8 @@ def sync(draft_id: int, *, force: bool = False) -> dict:
             for kind, value in rest:
                 if kind == "image":
                     _insert_image(doc, int(value))
+                elif kind == "clip":
+                    _insert_clip(doc, int(value))
                 else:
                     _write(["docs", "+update", "--as", "user", "--doc", doc, "--command", "append"], str(value))
             rev = _revision(doc)

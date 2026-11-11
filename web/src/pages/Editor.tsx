@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, type Draft, type DraftImage, type Publication, type RevisionInfo, type Status, type Thread } from '../api'
+import { api, ApiError, DRAFT_FIELDS, pubLabel, type Draft, type DraftClip, type DraftField, type DraftImage, type DraftRevs,
+  type Publication, type RevisionInfo, type Status, type Thread } from '../api'
 import { go } from '../App'
 import { ago, AutoTextarea, Dialog, PlatformPill, useToast } from '../ui'
 import * as Ic from '../icons'
-import { CasesPanel, FeedCard, FeishuLine, MediaPanel, PublishLongform, uploadImages } from './Longform'
+import { CasesPanel, FeedCard, FeishuLine, MediaPanel, PublishLongform, uploadClip, uploadImages } from './Longform'
 import { RichEditor, type Selection } from '../RichEditor'
 import { CommentsPanel, DiffDialog, waiting } from './Comments'
 import { XhsPanel } from './Xhs'
@@ -13,7 +14,7 @@ import type { Editor as TiptapEditor } from '@tiptap/react'
 
 type Preview = { flags: string[]; thread?: { index: number; text: string; weighted: number; over: boolean }[]; html?: string }
 type Version = { id: number; title: string; body: string; created_at: number; origin: string }
-type SideTab = 'preview' | 'comments' | 'media' | 'xhs' | 'video' | 'cases' | 'notes' | 'voice' | 'log'
+type SideTab = 'preview' | 'comments' | 'media' | 'xhs' | 'video' | 'cases' | 'notes' | 'context' | 'voice' | 'log'
 
 const SEP = '\n---\n'
 const SPLIT = /\n[ \t]*-{3,}[ \t]*\n/
@@ -37,6 +38,25 @@ function normalizeThread(body: string) {
   return body.split(SPLIT).map(s => s.trim()).join(SEP)
 }
 
+type Fields = Record<DraftField, string>
+/** What the server held when the page last loaded or saved each field, and that version's fingerprint. */
+type Base = { values: Fields; rev: DraftRevs }
+const FIELD_NAMES: Record<DraftField, string> = { title: '标题', body: '正文', notes: '备注', summary: '摘要', source_url: '阅读原文', context: '背景资料' }
+const CHECK_EVERY = 5000
+const BUSY = ['generating', 'revising']
+
+/** The draft the way the editor holds it (an X thread is kept normalized). */
+function fromServer(d: Draft): Fields {
+  return { title: d.title, body: d.platform === 'x' ? normalizeThread(d.body) : d.body, notes: d.notes,
+    summary: d.summary || '', source_url: d.source_url || '', context: d.context || '' }
+}
+
+function pick<T>(from: Record<DraftField, T>, fields: readonly DraftField[]): Partial<Record<DraftField, T>> {
+  return Object.fromEntries(fields.map(f => [f, from[f]]))
+}
+
+const names = (fields: readonly DraftField[]) => fields.map(f => FIELD_NAMES[f]).join('、')
+
 const SIDE_KEY = 'cw-editor-side'
 
 export function Editor({ id, status }: { id: number; status: Status | null }) {
@@ -45,6 +65,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
   const [notes, setNotes] = useState('')
+  const [context, setContext] = useState('')
   const [summary, setSummary] = useState('')
   const [sourceUrl, setSourceUrl] = useState('')
   const [saved, setSaved] = useState<'saved' | 'saving' | 'dirty'>('saved')
@@ -56,6 +77,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
   const [versions, setVersions] = useState<Version[] | null>(null)
   const [author, setAuthor] = useState('')
   const [uploading, setUploading] = useState(false)
+  const [clipUpload, setClipUpload] = useState<{ name: string; pct: number } | null>(null)
   const [threads, setThreads] = useState<Thread[]>([])
   const [activeThread, setActiveThread] = useState<number | null>(null)
   const [pendingSel, setPendingSel] = useState<Selection | null>(null)
@@ -63,13 +85,39 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
   const [poll, setPoll] = useState(0)
   const [diffFor, setDiffFor] = useState<number | null>(null)
   const [hiddenRevision, setHiddenRevision] = useState<number | null>(null)
+  // fields changed here and elsewhere since the page loaded them: saving stops until the author picks a side
+  const [clash, setClash] = useState<DraftField[] | null>(null)
+  // after taking the newer version: what the page had and couldn't save, kept on screen
+  const [kept, setKept] = useState<{ fields: DraftField[]; mine: Fields; stored: boolean } | null>(null)
+  const [base, setBase] = useState<Base | null>(null)
+  const baseRef = useRef<Base | null>(null)
+  const clashRef = useRef(clash)
+  clashRef.current = clash
   const loaded = useRef(false)
   const lastStatus = useRef<string | null>(null)
   const richRef = useRef<TiptapEditor | null>(null)
-  const latest = useRef({ title, body, notes, summary, sourceUrl })
-  latest.current = { title, body, notes, summary, sourceUrl }
+  const latest = useRef<Fields>({ title, body, notes, summary, source_url: sourceUrl.trim(), context })
+  latest.current = { title, body, notes, summary, source_url: sourceUrl.trim(), context }
+  const saving = useRef(false)
+  const writes = useRef(0)            // saves started; a change check that saw one start meanwhile is dropped
+  const queue = useRef<Promise<void>>(Promise.resolve())
 
   const loadThreads = useCallback(() => api.get<Thread[]>(`/api/drafts/${id}/comments`).then(setThreads).catch(() => {}), [id])
+
+  const updateBase = useCallback((next: (b: Base | null) => Base) => {
+    baseRef.current = next(baseRef.current)
+    setBase(baseRef.current)
+  }, [])
+
+  /** Show the server's version of these fields and edit on from it. */
+  const take = useCallback((d: Draft, fields: readonly DraftField[]) => {
+    if (!fields.length || !d.rev) return
+    const v = fromServer(d)
+    const set: Record<DraftField, (s: string) => void> = { title: setTitle, body: setBody, notes: setNotes, summary: setSummary,
+      source_url: setSourceUrl, context: setContext }
+    for (const f of fields) set[f](v[f])
+    updateBase(b => ({ values: { ...(b?.values || v), ...pick(v, fields) }, rev: { ...(b?.rev || d.rev!), ...pick(d.rev!, fields) } }))
+  }, [updateBase])
 
   // load; keep polling while AI is drafting or revising, then take its text
   useEffect(() => {
@@ -79,8 +127,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
       setDraft(d)
       const finishedRevision = lastStatus.current === 'revising' && d.status !== 'revising'
       if (!loaded.current || d.status === 'generating' || finishedRevision) {
-        setTitle(d.title); setBody(d.platform === 'x' ? normalizeThread(d.body) : d.body); setNotes(d.notes)
-        setSummary(d.summary || ''); setSourceUrl(d.source_url || '')
+        take(d, DRAFT_FIELDS)
         if (!loaded.current) setTab(d.platform === 'x' ? 'notes' : 'preview')
       }
       if (finishedRevision) {
@@ -95,7 +142,51 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
     loadThreads().then(() => undefined)
     t = window.setInterval(load, 4000)
     return () => window.clearInterval(t)
-  }, [id, toast, poll, loadThreads])
+  }, [id, toast, poll, loadThreads, take])
+
+  /** Take in what changed elsewhere (an AI revision written from outside, another tab). A field the author
+   * hasn't touched here is replaced; one changed on both sides waits for the author to choose. */
+  const merge = useCallback((d: Draft) => {
+    const b = baseRef.current
+    if (!b || !d.rev) return
+    const mine = latest.current, theirs = fromServer(d)
+    const moved = DRAFT_FIELDS.filter(f => d.rev![f] !== b.rev[f])
+    const clean = moved.filter(f => mine[f] === b.values[f] || mine[f] === theirs[f])
+    const clashing = moved.filter(f => !clean.includes(f))
+    setDraft(d)
+    take(d, clean)
+    if (moved.length) loadThreads()
+    setClash(clashing.length ? clashing : null)
+    if (!clashing.length && clean.length) toast(`这篇稿子的${names(clean)}在别处改过，已换成最新的`)
+  }, [take, loadThreads, toast])
+
+  const checkRemote = useCallback(async () => {
+    if (!loaded.current || saving.current || BUSY.includes(lastStatus.current || '')) return
+    const started = writes.current
+    const fresh = () => writes.current === started && !saving.current
+    try {
+      const r = await api.get<{ rev: DraftRevs; status: string }>(`/api/drafts/${id}/rev`)
+      const b = baseRef.current
+      if (!b || !fresh()) return
+      if (BUSY.includes(r.status)) { setPoll(n => n + 1); return }  // AI started on it elsewhere: follow it like our own
+      if (DRAFT_FIELDS.every(f => r.rev[f] === b.rev[f])) return
+      const d = await api.get<Draft>(`/api/drafts/${id}`)
+      if (fresh()) merge(d)
+    } catch { /* the next check tries again */ }
+  }, [id, merge])
+
+  // an open page keeps checking whether the draft changed elsewhere, and checks at once when it comes back into view
+  useEffect(() => {
+    const check = () => { if (!document.hidden) void checkRemote() }
+    const t = window.setInterval(check, CHECK_EVERY)
+    window.addEventListener('focus', check)
+    document.addEventListener('visibilitychange', check)
+    return () => {
+      window.clearInterval(t)
+      window.removeEventListener('focus', check)
+      document.removeEventListener('visibilitychange', check)
+    }
+  }, [checkRemote])
 
   // open threads become highlights in the article
   const anchors: Anchor[] = threads.filter(t => t.status === 'open' && t.quote)
@@ -126,6 +217,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
   }
 
   async function revise() {
+    if (clash) { toast('先处理上面的冲突：这页上的改动还没保存', 'error'); return }
     if (saved !== 'saved') await save()
     try {
       await api.post(`/api/drafts/${id}/revise`)
@@ -140,31 +232,85 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
     try {
       await api.post(`/api/drafts/${id}/undo-revision`)
       const d = await api.get<Draft>(`/api/drafts/${id}`)
-      setDraft(d); setTitle(d.title); setBody(d.body); toast('已撤回这一轮')
+      setDraft(d); take(d, ['title', 'body']); toast('已撤回这一轮')
     } catch (e) { toast((e as Error).message, 'error') }
   }
 
   useEffect(() => { api.get<{ author: string }>('/api/settings').then(s => setAuthor(s.author)).catch(() => {}) }, [])
 
-  const save = useCallback(async () => {
-    const { title, body, notes, summary, sourceUrl } = latest.current
+  // Sends only the fields changed here, each with the version it was edited from; the server refuses (409)
+  // a field that changed elsewhere meanwhile instead of overwriting it.
+  const saveNow = useCallback(async () => {
+    const b = baseRef.current
+    if (!b || clashRef.current) return
+    const mine = latest.current
+    const changed = DRAFT_FIELDS.filter(f => mine[f] !== b.values[f])
+    if (!changed.length) return
+    saving.current = true
+    writes.current += 1
     setSaved('saving')
+    let refused = false
     try {
-      await api.put(`/api/drafts/${id}`, { title, body, notes, summary, source_url: sourceUrl.trim() })
-      setDraft(d => d && { ...d, title, body, notes, summary, source_url: sourceUrl.trim() })
+      const r = await api.put<{ rev: DraftRevs }>(`/api/drafts/${id}`, { ...pick(mine, changed), base: pick(b.rev, changed) })
+      updateBase(now => ({ values: { ...now!.values, ...pick(mine, changed) }, rev: { ...now!.rev, ...pick(r.rev, changed) } }))
       setSaved('saved'); setSavedAt(Date.now() / 1000)
-    } catch (e) { toast((e as Error).message, 'error'); setSaved('dirty') }
-  }, [id, toast])
+    } catch (e) {
+      setSaved('dirty')
+      if (e instanceof ApiError && e.status === 409) { refused = true; setClash(c => c || [...changed]) }
+      else toast((e as Error).message, 'error')
+    } finally { saving.current = false }
+    if (refused) await checkRemote()  // fetch the newer version: fields untouched here come in, the rest wait for a choice
+  }, [id, toast, updateBase, checkRemote])
+
+  /** One save at a time, in order; resolves once this one is through. */
+  const save = useCallback(() => {
+    const run = queue.current.then(saveNow)
+    queue.current = run.catch(() => {})
+    return run
+  }, [saveNow])
 
   // autosave
   useEffect(() => {
-    if (!loaded.current || !draft) return
-    if (title === draft.title && body === draft.body && notes === draft.notes
-      && summary === (draft.summary || '') && sourceUrl.trim() === (draft.source_url || '')) return
+    if (!loaded.current || !draft || !base) return
+    const mine = { title, body, notes, summary, source_url: sourceUrl.trim(), context }
+    if (DRAFT_FIELDS.every(f => mine[f] === base.values[f])) { setSaved(s => (s === 'dirty' ? 'saved' : s)); return }
     setSaved('dirty')
+    if (clash) return
     const t = window.setTimeout(save, 900)
     return () => window.clearTimeout(t)
-  }, [title, body, notes, summary, sourceUrl, draft, save])
+  }, [title, body, notes, summary, sourceUrl, context, draft, base, clash, save])
+
+  /** Settle a clash by taking the newer version; what the page had stays on screen and, for title and body, in the history. */
+  async function takeLatest() {
+    try {
+      const d = await api.get<Draft>(`/api/drafts/${id}`)
+      const b = baseRef.current!, mine = latest.current, theirs = fromServer(d)
+      const moved = DRAFT_FIELDS.filter(f => d.rev![f] !== b.rev[f])
+      const lost = moved.filter(f => mine[f] !== b.values[f] && mine[f] !== theirs[f])
+      const stored = lost.includes('title') || lost.includes('body')
+      if (stored) await api.post(`/api/drafts/${id}/versions`, { origin: 'unsaved', title: mine.title, body: mine.body })
+      setDraft(d); take(d, moved); setClash(null)
+      setKept(lost.length ? { fields: lost, mine, stored } : null)
+      loadThreads()
+    } catch (e) { toast((e as Error).message, 'error') }
+  }
+
+  /** Settle a clash by saving this page's version over the newer one, which stays in the history. */
+  async function keepMine() {
+    if (!window.confirm('用你这页上的版本覆盖别处的改动？被覆盖的那版会存进历史版本，需要时还能找回来。')) return
+    try {
+      const d = await api.get<Draft>(`/api/drafts/${id}`)
+      const b = baseRef.current!, mine = latest.current
+      const moved = DRAFT_FIELDS.filter(f => d.rev![f] !== b.rev[f])
+      const ours = moved.filter(f => mine[f] !== b.values[f])
+      if (ours.includes('title') || ours.includes('body')) {
+        await api.post(`/api/drafts/${id}/versions`, { origin: 'replaced', title: d.title, body: d.body })
+      }
+      // our fields now count as edited from the newest version, so the next save goes through; the rest come in
+      updateBase(now => ({ values: now!.values, rev: { ...now!.rev, ...pick(d.rev!, ours) } }))
+      setDraft(d); take(d, moved.filter(f => !ours.includes(f))); setClash(null)
+    } catch (e) { toast((e as Error).message, 'error') }
+  }
 
   async function patchCovers(patch: Partial<Draft>) {
     setDraft(d => d && { ...d, ...patch })
@@ -189,6 +335,21 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
     } catch (e) { toast((e as Error).message, 'error'); return [] } finally { setUploading(false) }
   }
 
+  /** Videos go up in pieces, one at a time; the editor inserts them once they are up. */
+  async function addClips(files: File[]): Promise<number[]> {
+    const ids: number[] = []
+    for (const f of files) {
+      setClipUpload({ name: f.name, pct: 0 })
+      try {
+        const c: DraftClip = await uploadClip(id, f, share => setClipUpload({ name: f.name, pct: Math.round(share * 100) }))
+        setDraft(d => d && { ...d, clips: [...(d.clips || []), c] })
+        ids.push(c.id)
+      } catch (e) { toast(`${f.name}：${(e as Error).message}`, 'error') }
+    }
+    setClipUpload(null)
+    return ids
+  }
+
   // server preview (rendered 公众号 HTML and voice flags)
   useEffect(() => {
     if (!draft) return
@@ -202,6 +363,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
     setSideOpen(v => { try { localStorage.setItem(SIDE_KEY, v ? 'closed' : 'open') } catch { /* */ } return !v })
   }
   async function openPublish() {
+    if (clash) { toast('先处理上面的冲突：这页上的改动还没保存', 'error'); return }
     if (saved !== 'saved') await save()
     setConfirming(true)
   }
@@ -220,7 +382,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
   const flags = preview?.flags || []
   const pubs = draft.publications || []
   const connected = isX ? status?.x_connected : status?.wechat_configured
-  const tabs = ((isX ? ['comments', 'notes', 'cases', 'voice', 'log'] : ['preview', 'comments', 'media', 'xhs', 'video', 'cases', 'notes', 'voice', 'log']) as SideTab[])
+  const tabs = ((isX ? ['comments', 'notes', 'context', 'cases', 'voice', 'log'] : ['preview', 'comments', 'media', 'xhs', 'video', 'cases', 'notes', 'context', 'voice', 'log']) as SideTab[])
     .filter(k => k !== 'cases' || status?.case_search)
   const revising = draft.status === 'revising'
   const todo = waiting(threads)
@@ -239,7 +401,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
             <span className="t">{title || '未命名'}</span>
           </div>
           <span className="save-state" aria-live="polite">
-            {saved === 'saving' ? <><Ic.Loader size={12} /> 保存中</> : saved === 'dirty' ? '有改动' : savedAt ? <><Ic.Check size={12} /> 已保存</> : `上次编辑 ${ago(draft.updated_at)}`}
+            {clash ? <><Ic.Alert size={12} /> 没保存</> : saved === 'saving' ? <><Ic.Loader size={12} /> 保存中</> : saved === 'dirty' ? '有改动' : savedAt ? <><Ic.Check size={12} /> 已保存</> : `上次编辑 ${ago(draft.updated_at)}`}
           </span>
           <div className="right">
             <button className="btn ghost icon" aria-label="历史版本" title="历史版本" onClick={async () => setVersions(await api.get<Version[]>(`/api/drafts/${id}/versions`))}><Ic.History /></button>
@@ -258,6 +420,29 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
           <div className="writing">
             {draft.status === 'failed' && <div className="callout" style={{ marginBottom: 18 }}><Ic.Alert size={15} /><span>起草失败：{draft.error}</span></div>}
             {revising && <div className="callout info revise-note"><Ic.Loader size={15} /><span>AI 正在按你的批注改稿，一般一两分钟，改好会自动刷新。这期间正文先锁住。</span></div>}
+            {clash && (
+              <div className="callout revise-note" role="alert">
+                <Ic.Alert size={15} />
+                <span><b>这篇稿子的{names(clash)}在别处改过了</b>（AI 改稿或别的页面），你这页上也改了还没保存。自动保存先停下，免得两边互相盖掉。你这页上的字都还在。</span>
+                <span className="acts">
+                  <button className="btn sm primary" onClick={takeLatest}>载入最新版</button>
+                  <button className="btn ghost sm" onClick={keepMine}>还是用我这版</button>
+                </span>
+              </div>
+            )}
+            {kept && (
+              <div className="callout info revise-note kept-note">
+                <Ic.Note size={15} />
+                <span>已换成最新版。你刚才没保存上的{names(kept.fields)}放在下面{kept.stored ? '，也存进了历史版本「没保存上的版本」' : ''}，要用哪段复制过去。</span>
+                <span className="acts"><button className="btn ghost sm icon" aria-label="收起" onClick={() => setKept(null)}><Ic.Close size={13} /></button></span>
+                {kept.fields.map(f => (
+                  <label key={f} className="kept-field">
+                    <span className="small muted">{FIELD_NAMES[f]}</span>
+                    <textarea className="textarea" readOnly rows={Math.min(8, kept.mine[f].split('\n').length + 1)} value={kept.mine[f]} />
+                  </label>
+                ))}
+              </div>
+            )}
             {showRevision && revision && (
               <div className="callout info revise-note">
                 <Ic.Sparkle size={15} />
@@ -282,11 +467,12 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
                   <ThreadEditor segs={segs} lengths={lengths} onChange={next => setBody(next.join(SEP))} />
                 ) : (
                   <>
-                    <RichEditor value={body} onChange={setBody} onFiles={addFiles} editorRef={richRef} placeholder="从这里开始写"
+                    <RichEditor value={body} onChange={setBody} onFiles={addFiles} onClips={addClips} editorRef={richRef} placeholder="从这里开始写"
                       editable={!revising} anchors={anchors} activeAnchor={activeThread} onAnchorClick={focusThread}
                       onComment={sel => { setPendingSel(sel); setSideOpen(true); setTab('comments') }} />
                     {uploading && <div className="row small muted" style={{ marginTop: 8 }}><Ic.Loader size={13} /> 正在上传图片…</div>}
-                    <div className="md-hint">图片直接粘贴或拖进正文。高亮在 X 长文里会变成加粗（X 不支持高亮）。封面在右边“封面·配图”里选。</div>
+                    {clipUpload && <div className="row small muted" style={{ marginTop: 8 }}><Ic.Loader size={13} /> 正在上传视频「{clipUpload.name}」{clipUpload.pct}%，传完会出现在光标处，别关这个页面</div>}
+                    <div className="md-hint">图片、视频直接粘贴或拖进正文。视频推到 X 长文时能直接播放；公众号和星球的接口放不进视频，那里会换成视频的一帧画面。高亮在 X 长文里会变成加粗（X 不支持高亮）。封面在右边“封面·配图”里选。</div>
                   </>
                 )}
               </>
@@ -307,6 +493,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
                 {k === 'video' && <><Ic.Film size={15} /> 视频{draft.video?.status && <Ic.Loader size={12} />}</>}
                 {k === 'cases' && <><Ic.Bulb size={15} /> 找案例</>}
                 {k === 'notes' && <><Ic.Doc size={15} /> 备注</>}
+                {k === 'context' && <><Ic.Book size={15} /> 背景资料</>}
                 {k === 'voice' && <><Ic.Sparkle size={15} /> 文风{flags.length > 0 && <span className="badge">{flags.length}</span>}</>}
                 {k === 'log' && <><Ic.Send size={15} /> 记录{pubs.length > 0 && <span className="faint small">{pubs.length}</span>}</>}
               </button>
@@ -344,6 +531,13 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
                 <AutoTextarea className="textarea notes-input" value={notes} onChange={e => setNotes(e.target.value)} placeholder="要核实的事实、待补的话……" />
               </div>
             )}
+            {tab === 'context' && (
+              <div className="stack">
+                <div className="small muted">写这篇稿子时的事实依据：人物、时间线、数字、链接，哪些能公开。AI 按批注改稿、做小红书版和视频时都会读，只拿来核对事实，不会照搬进正文。它不会发出去，也不存进飞书。</div>
+                <AutoTextarea className="textarea notes-input" aria-label="背景资料" value={context} onChange={e => setContext(e.target.value)}
+                  placeholder="比如作者的 GitHub 和 X 账号、事情的时间线、实际数据，哪些不能写进正文……" />
+              </div>
+            )}
             {tab === 'voice' && (
               flags.length === 0 ? (
                 <div className="empty"><div className="empty-icon"><Ic.Check /></div><b>没有明显的 AI 腔</b><div className="small">这是按你过去 70 多篇公众号算出来的习惯，只是参考。</div></div>
@@ -370,7 +564,7 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
           onSent={() => { setConfirming(false); setTab('log'); setSideOpen(true); api.get<Draft>(`/api/drafts/${id}`).then(setDraft); window.dispatchEvent(new Event('cw-refresh-status')) }} />
       ) : (
         <PublishLongform open={confirming} draft={{ ...draft, title, body, summary, source_url: sourceUrl.trim() }} body={body} status={status}
-          onClose={() => setConfirming(false)}
+          onClose={() => setConfirming(false)} onPushed={() => api.get<Draft>(`/api/drafts/${id}`).then(setDraft).catch(() => {})}
           onSent={() => { setConfirming(false); setTab('log'); setSideOpen(true); api.get<Draft>(`/api/drafts/${id}`).then(setDraft); window.dispatchEvent(new Event('cw-refresh-status')) }} />
       )}
 
@@ -383,7 +577,8 @@ export function Editor({ id, status }: { id: number; status: Status | null }) {
               <div key={v.id} className="list-row" style={{ cursor: 'default' }}>
                 <span className="src-icon">{['generated', 'ai-draft', 'ai-revise'].includes(v.origin) ? <Ic.Sparkle size={15} /> : <Ic.Note size={15} />}</span>
                 <div className="grow">
-                  <div className="t">{({ generated: 'AI 底稿', 'ai-draft': 'AI 底稿', 'ai-revise': 'AI 按批注改的', 'before-ai': '发批注前你的版本', 'undo-ai': '撤回前的 AI 版本' } as Record<string, string>)[v.origin] || '你的修改'} · {ago(v.created_at)}</div>
+                  <div className="t">{({ generated: 'AI 底稿', 'ai-draft': 'AI 底稿', 'ai-revise': 'AI 按批注改的', 'before-ai': '发批注前你的版本', 'undo-ai': '撤回前的 AI 版本',
+                    unsaved: '没保存上的版本', replaced: '被你覆盖掉的版本' } as Record<string, string>)[v.origin] || '你的修改'} · {ago(v.created_at)}</div>
                   <div className="sub">{v.body.slice(0, 80)}</div>
                 </div>
                 <button className="btn sm" onClick={() => { setTitle(v.title); setBody(draft.platform === 'x' ? normalizeThread(v.body) : v.body); setVersions(null); toast('已恢复这个版本') }}>恢复</button>
@@ -443,13 +638,12 @@ function PubLine({ p }: { p: Publication }) {
   let info: Record<string, unknown> = {}
   try { info = JSON.parse(p.detail || '{}') } catch { /* ignore */ }
   const ok = p.state === 'sent'
-  const where = p.platform === 'x' ? 'X' : p.platform === 'x_article' ? 'X 长文草稿' : p.platform === 'zsxq' ? '星球草稿箱' : '公众号草稿箱'
-  const label = ok ? (p.platform === 'x' ? '已发出' : `已进${where}`) : p.state === 'unknown' ? `${where}：结果不确定，去平台上看一眼` : `${where}：失败`
+  const label = pubLabel(p)
   return (
     <div className="pub-item">
-      <span className={'pill ' + (ok ? 'ok' : p.state === 'unknown' ? 'warn' : 'danger')}>{label}</span>
+      <span className={'pill ' + (ok ? 'ok' : p.state === 'unknown' || p.state === 'pending' ? 'warn' : 'danger')}>{label}</span>
       <span className="muted">{ago(p.created_at)}</span>
-      {p.platform === 'x' && p.remote_id && <a href={`https://x.com/i/status/${p.remote_id.split(',')[0]}`} target="_blank" rel="noreferrer">看推文 <Ic.External size={12} /></a>}
+      {(p.platform === 'x' || p.platform === 'x_video') && p.remote_id && <a href={`https://x.com/i/status/${p.remote_id.split(',')[0]}`} target="_blank" rel="noreferrer">看推文 <Ic.External size={12} /></a>}
       {p.platform === 'x_article' && ok && <a href="https://x.com/compose/articles" target="_blank" rel="noreferrer">去 X 看草稿 <Ic.External size={12} /></a>}
       {p.platform === 'zsxq' && ok && typeof info.url === 'string' && <a href={info.url} target="_blank" rel="noreferrer">去星球看草稿 <Ic.External size={12} /></a>}
       {typeof info.error === 'string' && <div className="err" style={{ width: '100%' }}>{info.error}</div>}

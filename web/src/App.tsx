@@ -83,8 +83,8 @@ function Root() {
 
   let body: ReactNode
   const fullBleed = ((route.page === 'drafts' || route.page === 'videos') && !!route.id) || route.page === 'materials'
-  if (route.page === 'drafts' && route.id) body = <Editor id={route.id} status={status} />
-  else if (route.page === 'videos' && route.id) body = <VideoStudio id={route.id} />
+  if (route.page === 'drafts' && route.id) body = <Editor key={route.id} id={route.id} status={status} />
+  else if (route.page === 'videos' && route.id) body = <VideoStudio id={route.id} status={status} />
   else if (route.page === 'videos') body = <Videos />
   else if (route.page === 'materials') body = <Materials openId={route.id} />
   else if (route.page === 'ideas') body = <Ideas />

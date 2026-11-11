@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { api, type Draft, type DraftImage, type VideoItem, type VideoOptions, type VideoRow, type VideoScene, type VideoState } from '../api'
+import { api, renderOf, type Draft, type DraftClip, type DraftImage, type VideoCover, type VideoFormat, type VideoItem, type VideoMeta, type VideoOptions, type VideoRow, type VideoScene, type VideoState } from '../api'
 import { AutoTextarea, useToast } from '../ui'
 import { go } from '../App'
 import { imgUrl } from './Longform'
 import * as Ic from '../icons'
 
-export const TYPES: VideoScene['type'][] = ['hook', 'points', 'shot', 'stat', 'change', 'quote', 'cta']
+export const TYPES: VideoScene['type'][] = ['hook', 'points', 'shot', 'clip', 'stat', 'change', 'quote', 'cta']
 export const TYPE_LABEL: Record<VideoScene['type'], string> = {
-  hook: '开头大字', points: '要点卡片', shot: '截图放大', stat: '数字', change: '前后对比', quote: '金句', cta: '结尾',
+  hook: '开头大字', points: '要点卡片', shot: '截图放大', clip: '原片片段', stat: '数字', change: '前后对比', quote: '金句', cta: '结尾',
 }
 export const TYPE_HINT: Record<VideoScene['type'], string> = {
   hook: '一两行大字抛出这条视频的看点，可以再跟几张小卡片',
   points: '标题加 1 到 4 张卡片，读到哪条出哪条',
   shot: '真实截图放进窗口，读到某句时推近到框出的区域',
+  clip: '长文里的视频直接在画面里播，播多长跟着口播走，片段不够长就停在最后一帧',
   stat: '一个数字滚动出来，可以再变成另一个数字',
   change: '原来的说法被划掉，改后的说法打出来',
   quote: '一句大字观点，标亮一个词',
@@ -107,8 +108,71 @@ function ImagePick({ images, value, onPick }: { images: DraftImage[]; value?: nu
   )
 }
 
-export function SceneEditor({ scene, images, set }: { scene: VideoScene; images: DraftImage[]; set: (patch: Partial<VideoScene>) => void }) {
+const clipPoster = (id: number) => `/api/clips/${id}/poster.jpg`
+const fmtSecs = (n: number) => `${Math.round(n * 10) / 10}`
+
+function ClipPick({ clips, value, onPick }: { clips: DraftClip[]; value?: number; onPick: (id: number) => void }) {
+  if (!clips.length) return <div className="small faint">这篇长文的正文里还没有视频，先在长文里插一段</div>
+  return (
+    <div className="vthumbs">
+      {clips.map(c => (
+        <button type="button" key={c.id} className={'vthumb' + (c.id === value ? ' on' : '')} onClick={() => onPick(c.id)}
+          aria-pressed={c.id === value} title={`${c.name} · ${fmtSecs(c.duration || 0)} 秒`}>
+          <img src={clipPoster(c.id)} alt={c.name} />
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** Seconds typed as text, so "1." survives while typing; empty means "not set". */
+function SecInput({ value, placeholder, label, onChange }: { value?: number; placeholder: string; label: string; onChange: (v: number | undefined) => void }) {
+  const [text, setText] = useState(value === undefined ? '' : fmtSecs(value))
+  useEffect(() => {
+    setText(prev => {
+      const same = prev.trim() ? Number(prev) === value : value === undefined
+      return same ? prev : value === undefined ? '' : fmtSecs(value)
+    })
+  }, [value])
+  return (
+    <input className="input" inputMode="decimal" value={text} placeholder={placeholder} aria-label={label}
+      onChange={e => {
+        setText(e.target.value)
+        const n = Number(e.target.value)
+        if (!e.target.value.trim()) onChange(undefined)
+        else if (Number.isFinite(n) && n >= 0) onChange(Math.round(n * 10) / 10)
+      }} />
+  )
+}
+
+/** Which stretch of the video the scene plays: typed, or taken from where the player stands. */
+function ClipRange({ clip, scene, set }: { clip: DraftClip; scene: VideoScene; set: (patch: Partial<VideoScene>) => void }) {
+  const player = useRef<HTMLVideoElement>(null)
+  const length = clip.duration || 0
+  const start = scene.clip_start || 0
+  const end = scene.clip_end ?? length
+  const here = () => Math.round((player.current?.currentTime || 0) * 10) / 10
+  return (
+    <div className="stack" style={{ gap: 8 }}>
+      <video ref={player} className="vclip" src={`/api/clips/${clip.id}`} poster={clipPoster(clip.id)} controls muted playsInline preload="metadata" />
+      <div className="vgrid2">
+        <Field label="从第几秒"><SecInput value={scene.clip_start} placeholder="0" label="从第几秒开始" onChange={v => set({ clip_start: v })} /></Field>
+        <Field label="到第几秒" hint="空着就播到结尾"><SecInput value={scene.clip_end} placeholder={fmtSecs(length)} label="到第几秒结束" onChange={v => set({ clip_end: v })} /></Field>
+      </div>
+      <div className="row" style={{ gap: 6 }}>
+        <button type="button" className="btn ghost sm" onClick={() => set({ clip_start: here() })}>从播放位置开始</button>
+        <button type="button" className="btn ghost sm" onClick={() => set({ clip_end: here() })}>到播放位置结束</button>
+      </div>
+      <div className="small faint">这段视频 {fmtSecs(length)} 秒，这个镜头播 {fmtSecs(Math.max(0, end - start))} 秒；口播比这长，画面就停在最后一帧。</div>
+    </div>
+  )
+}
+
+export function SceneEditor({ scene, images, clips = [], set }: {
+  scene: VideoScene; images: DraftImage[]; clips?: DraftClip[]; set: (patch: Partial<VideoScene>) => void
+}) {
   const img = images.find(im => im.id === scene.image)
+  const clip = clips.find(c => c.id === scene.clip)
   const head = (
     <>
       <div className="vgrid2">
@@ -151,6 +215,33 @@ export function SceneEditor({ scene, images, set }: { scene: VideoScene; images:
               onChange={e => set({ badges: textItems(e.target.value.replace(/[,，]/g, '\n'), scene.badges, false).slice(0, 2) })} /></Field>
           </div>
           <Field label="读到一半换成的标题" hint="可选"><input className="input" value={scene.title2 || ''} onChange={e => set({ title2: e.target.value })} /></Field>
+        </>
+      )
+    case 'clip':
+      return (
+        <>
+          {head}
+          <Field label="视频"><ClipPick clips={clips} value={scene.clip} onPick={id => set({ clip: id, clip_start: undefined, clip_end: undefined })} /></Field>
+          {clip && <ClipRange key={clip.id} clip={clip} scene={scene} set={set} />}
+          <div className="vgrid2">
+            <Field label="画面" hint="自动：和画幅同比例就铺满">
+              <select className="input" value={scene.fill || ''} onChange={e => set({ fill: (e.target.value || undefined) as VideoScene['fill'] })}>
+                <option value="">自动</option>
+                <option value="full">铺满全屏</option>
+                <option value="window">放在框里</option>
+              </select>
+            </Field>
+            <div className="vfield">
+              <span>原声<em>默认静音</em></span>
+              <label className="vcheck small"><input type="checkbox" checked={!!scene.sound} onChange={e => set({ sound: e.target.checked || undefined })} /> 压低混在口播下面</label>
+            </div>
+          </div>
+          <div className="vgrid2">
+            <Field label="标注" hint="可选，如 抖音 · 141万播放"><input className="input" value={scene.label || ''} onChange={e => set({ label: e.target.value })} /></Field>
+            <Field label="角上的来源" hint="可选，如 @账号 · TikTok"><input className="input" value={scene.source || ''} onChange={e => set({ source: e.target.value })} /></Field>
+          </div>
+          <Field label="徽章" hint="可选，逗号隔开"><input className="input" value={(scene.badges || []).map(b => b.text).join('，')}
+            onChange={e => set({ badges: textItems(e.target.value.replace(/[,，]/g, '\n'), scene.badges, false).slice(0, 2) })} /></Field>
         </>
       )
     case 'stat':
@@ -228,8 +319,9 @@ export function useVideo(draft: Draft | null, onDraft: (d: Draft) => void) {
       const d = await api.get<Draft>(`/api/drafts/${id}`).catch(() => null)
       if (!d) return
       const v = d.video || {}
-      setS(prev => ({ ...prev, status: v.status, stage: v.stage, pct: v.pct, error: v.error, video: v.video,
-        ...(prev.status === 'planning' ? { scenes: v.scenes, planned_at: v.planned_at, edited_at: v.edited_at } : {}) }))
+      setS(prev => ({ ...prev, status: v.status, stage: v.stage, pct: v.pct, error: v.error, rendering: v.rendering,
+        video: v.video, video_landscape: v.video_landscape,
+        ...(prev.status === 'planning' ? { scenes: v.scenes, planned_at: v.planned_at, edited_at: v.edited_at, style: v.style } : {}) }))
       if (!v.status) {
         onDraft(d)
         if (v.error) toast(v.error, 'error')
@@ -241,11 +333,31 @@ export function useVideo(draft: Draft | null, onDraft: (d: Draft) => void) {
     return () => window.clearInterval(t)
   }, [s.status, id, onDraft, toast])
 
+  // follow the model while it writes the title, intro and cover words
+  useEffect(() => {
+    if (s.meta_status !== 'generating' || !id) return
+    const t = window.setInterval(async () => {
+      const d = await api.get<Draft>(`/api/drafts/${id}`).catch(() => null)
+      const v = d?.video
+      if (!v || v.meta_status === 'generating') return
+      setS(prev => ({ ...prev, meta: v.meta, meta_status: v.meta_status, meta_error: v.meta_error }))
+      if (v.meta_error) toast(v.meta_error, 'error')
+      else toast('标题、简介和封面写好了')
+    }, 3000)
+    return () => window.clearInterval(t)
+  }, [s.meta_status, id, toast])
+
+  const metaPending = useRef<VideoMeta | null>(null)
   const flush = useCallback(async () => {
     window.clearTimeout(timer.current)
     const next = pending.current
+    const meta = metaPending.current
     pending.current = null
-    if (next && id) await api.put(`/api/drafts/${id}/video`, { scenes: next }).catch(e => toast((e as Error).message, 'error'))
+    metaPending.current = null
+    if (id && (next || meta)) {
+      await api.put(`/api/drafts/${id}/video`, { ...(next ? { scenes: next } : {}), ...(meta ? { meta } : {}) })
+        .catch(e => toast((e as Error).message, 'error'))
+    }
   }, [id, toast])
   // leaving the page saves what was typed in the last moment
   useEffect(() => () => { void flush() }, [flush])
@@ -257,34 +369,64 @@ export function useVideo(draft: Draft | null, onDraft: (d: Draft) => void) {
     window.clearTimeout(timer.current)
     timer.current = window.setTimeout(flush, 700)
   }
+  function setMeta(patch: Partial<Omit<VideoMeta, 'cover'>> & { cover?: Partial<VideoCover> }) {
+    const cur = s.meta || { title: '', intro: '', cover: { lines: [], key: '', kicker: '', image: null } }
+    const meta = { ...cur, ...patch, cover: { ...cur.cover, ...(patch.cover || {}) }, edited_at: Date.now() / 1000 }
+    setS(st => ({ ...st, meta }))
+    metaPending.current = meta
+    window.clearTimeout(timer.current)
+    timer.current = window.setTimeout(flush, 700)
+  }
+  async function writeMeta() {
+    if (!id) return
+    if (s.meta && !window.confirm('重新写标题、简介和封面字？你改过的会被覆盖。')) return
+    try {
+      await flush()
+      const next = await api.post<VideoState>(`/api/drafts/${id}/video/meta`)
+      setS(st => ({ ...st, meta_status: next.meta_status, meta_error: null }))
+    } catch (e) { toast((e as Error).message, 'error') }
+  }
   async function plan() {
     if (!id) return
     if (scenes.length && !window.confirm('按现在的长文重新写视频脚本？你改过的镜头会被覆盖。')) return
     try { const next = await api.post<VideoState>(`/api/drafts/${id}/video/plan`); was.current = next.status; setS(next) } catch (e) { toast((e as Error).message, 'error') }
   }
-  async function render() {
+  async function render(fmt: VideoFormat = 'vertical') {
     if (!id) return
     setBusy('render')
     try {
       await flush()
-      const next = await api.post<VideoState>(`/api/drafts/${id}/video/render`)
+      const next = await api.post<VideoState>(`/api/drafts/${id}/video/render?format=${fmt}`)
       was.current = next.status
-      setS(st => ({ ...st, status: next.status, stage: next.stage, pct: next.pct, error: null }))
+      setS(st => ({ ...st, status: next.status, stage: next.stage, pct: next.pct, rendering: next.rendering, error: null }))
     } catch (e) { toast((e as Error).message, 'error') } finally { setBusy('') }
   }
   async function setVoice(voice: string) {
     setS(st => ({ ...st, voice }))
     await api.put(`/api/drafts/${id}/video`, { voice }).catch(e => toast((e as Error).message, 'error'))
   }
+  async function setStyle(style: string) {
+    setS(st => ({ ...st, style }))
+    await api.put(`/api/drafts/${id}/video`, { style }).catch(e => toast((e as Error).message, 'error'))
+  }
+  async function setHeadline(headline: string[], headline_key?: string) {
+    setS(st => ({ ...st, headline, ...(headline_key !== undefined ? { headline_key } : {}) }))
+    await api.put(`/api/drafts/${id}/video`, { headline, ...(headline_key !== undefined ? { headline_key } : {}) })
+      .catch(e => toast((e as Error).message, 'error'))
+  }
   async function setBgm(bgm: boolean) {
     setS(st => ({ ...st, bgm }))
     await api.put(`/api/drafts/${id}/video`, { bgm }).catch(e => toast((e as Error).message, 'error'))
   }
-  const src = s.video && id ? `/api/drafts/${id}/video.mp4?v=${Math.round(s.video.rendered_at)}` : ''
-  async function share() {
+  const srcOf = (fmt: VideoFormat) => {
+    const r = renderOf(s, fmt)
+    return r && id ? `/api/drafts/${id}/video.mp4?format=${fmt}&v=${Math.round(r.rendered_at)}` : ''
+  }
+  const src = srcOf('vertical')
+  async function share(fmt: VideoFormat = 'vertical') {
     setBusy('share')
     try {
-      const blob = await (await fetch(src)).blob()
+      const blob = await (await fetch(srcOf(fmt))).blob()
       const file = new File([blob], `${(draft?.title || '视频').slice(0, 20)}.mp4`, { type: 'video/mp4' })
       if (!navigator.canShare || !navigator.canShare({ files: [file] })) { toast('这台设备不支持直接分享视频，用“下载 MP4”', 'error'); return }
       await navigator.share({ files: [file] })
@@ -292,10 +434,14 @@ export function useVideo(draft: Draft | null, onDraft: (d: Draft) => void) {
       if ((e as Error).name !== 'AbortError') toast((e as Error).message, 'error')
     } finally { setBusy('') }
   }
+  const staleOf = (fmt: VideoFormat) => {
+    const r = renderOf(s, fmt)
+    return !!(r && ((s.edited_at && s.edited_at > r.rendered_at) || (r.style && s.style && r.style !== s.style)))
+  }
   return {
-    s, opts, busy, scenes, src, saveScenes, flush, plan, render, setVoice, setBgm, share,
+    s, opts, busy, scenes, src, srcOf, saveScenes, flush, plan, render, setVoice, setBgm, setStyle, setHeadline, share, setMeta, writeMeta,
     total: scenes.reduce((n, sc) => n + speakSec(sc.say || ''), 0),
-    stale: !!(s.video && s.edited_at && s.edited_at > s.video.rendered_at),
+    stale: staleOf('vertical'), staleOf,
   }
 }
 
@@ -324,14 +470,21 @@ export function VideoCard({ draft, onDraft }: { draft: Draft; onDraft: (d: Draft
     <div className="stack video">
       {s.status === 'planning' ? (
         <div className="row muted small"><Ic.Loader size={14} /> 正在看文章里的截图、写分镜脚本，一般两三分钟。</div>
-      ) : s.status === 'rendering' ? <RenderProgress s={s} /> : s.video ? (
+      ) : s.status === 'rendering' ? <RenderProgress s={s} /> : s.video || s.video_landscape ? (
         <div className="vresult">
-          <video key={v.src} className="vplayer" src={v.src} controls playsInline preload="metadata" />
+          <video key={v.srcOf(s.video ? 'vertical' : 'landscape')} className={'vplayer' + (s.video ? '' : ' wide')}
+            src={v.srcOf(s.video ? 'vertical' : 'landscape')} controls playsInline preload="metadata" />
           <div className="vresult-side">
-            <div className="small muted">{fmtDur(s.video.duration)} · 1080×1920 · {fmtSize(s.video.size)}</div>
-            {v.stale && <div className="vnote small"><Ic.Alert size={13} /> 脚本改过了，重新出片才会更新。</div>}
-            <a className="btn sm" href={`/api/drafts/${draft.id}/video.mp4?download=1`}><Ic.Download size={14} /> 下载 MP4</a>
-            <button className="btn sm mobile-share" disabled={!!v.busy} onClick={v.share}>{v.busy === 'share' ? <Ic.Loader size={14} /> : <Ic.Send size={14} />} 分享到手机 App</button>
+            {(['vertical', 'landscape'] as const).map(f => {
+              const r = renderOf(s, f)
+              return r && (
+                <a key={f} className="btn sm" href={`/api/drafts/${draft.id}/video.mp4?format=${f}&download=1`}>
+                  <Ic.Download size={14} /> {f === 'vertical' ? '竖屏' : '横屏'} · {fmtDur(r.duration)} · {fmtSize(r.size)}
+                </a>
+              )
+            })}
+            {(v.staleOf('vertical') || v.staleOf('landscape')) && <div className="vnote small"><Ic.Alert size={13} /> 脚本或风格改过了，重新出片才会更新。</div>}
+            <button className="btn sm mobile-share" disabled={!!v.busy} onClick={() => v.share(s.video ? 'vertical' : 'landscape')}>{v.busy === 'share' ? <Ic.Loader size={14} /> : <Ic.Send size={14} />} 分享到手机 App</button>
           </div>
         </div>
       ) : (

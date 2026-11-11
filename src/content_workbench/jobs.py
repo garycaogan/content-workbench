@@ -43,6 +43,8 @@ def start(settings: Settings) -> None:
         conn.execute("UPDATE drafts SET feishu_state='failed', feishu_error='上次同步被重启打断' WHERE feishu_state='syncing'")
         conn.execute("UPDATE drafts SET status='draft' WHERE status='revising' AND id NOT IN "
                      "(SELECT json_extract(payload, '$.draft_id') FROM jobs WHERE kind='revise' AND state='queued')")
+    from . import video
+    video.recover_sends()  # a video upload cut off by the restart
     # Model calls run remotely, so a few in parallel is fine; transcription stays
     # on one worker so two Whisper runs never compete for the GPU.
     for n in range(WORKERS):
@@ -99,13 +101,21 @@ def _mark_failure(kind: str, payload: dict, exc: Exception) -> None:
             xhs.save(payload["draft_id"], state)
         elif kind == "revise":
             conn.execute("UPDATE drafts SET status='draft', error=? WHERE id=?", (f"按批注修改失败：{exc}"[:500], payload["draft_id"]))
+        elif kind == "video_meta":
+            from . import video
+            d = db.row("SELECT video FROM drafts WHERE id=?", (payload["draft_id"],))
+            state = video.load(d or {})
+            state.update(meta_status="", meta_error=f"生成标题和简介失败：{exc}"[:300])
+            conn.execute("UPDATE drafts SET video=? WHERE id=?", (json.dumps(state, ensure_ascii=False), payload["draft_id"]))
         elif kind in ("video_plan", "video_render"):
             from . import video
             d = db.row("SELECT video FROM drafts WHERE id=?", (payload["draft_id"],))
             state = video.load(d or {})
             what = "写视频脚本" if kind == "video_plan" else "出片"
-            state.update(status="", stage="", error=f"{what}失败：{exc}"[:400])
+            state.update(status="", stage="", rendering=None, error=f"{what}失败：{exc}"[:400])
             conn.execute("UPDATE drafts SET video=? WHERE id=?", (json.dumps(state, ensure_ascii=False), payload["draft_id"]))
+        elif kind == "clip":
+            conn.execute("UPDATE clips SET state='failed', error=? WHERE id=?", (f"视频处理失败：{exc}"[:300], payload["clip_id"]))
         elif kind == "import_feishu":
             failed = library_state().get("failed", {})
             failed[payload["token"]] = str(exc)[:200]
@@ -136,9 +146,17 @@ def run_job(settings: Settings, kind: str, payload: dict) -> None:
     elif kind == "video_plan":
         from . import video
         video.plan(settings, payload["draft_id"])
+        video.update(payload["draft_id"], meta_status="generating", meta_error=None)  # then the title, intro and cover
+        enqueue("video_meta", {"draft_id": payload["draft_id"]})
+    elif kind == "video_meta":
+        from . import video
+        video.write_meta(settings, payload["draft_id"])
     elif kind == "video_render":
         from . import video
-        video.render(settings, payload["draft_id"])
+        video.render(settings, payload["draft_id"], payload.get("format") or "vertical")
+    elif kind == "clip":
+        from . import clips
+        clips.process(payload["clip_id"])
     elif kind == "xhs":
         from . import xhs
         try:

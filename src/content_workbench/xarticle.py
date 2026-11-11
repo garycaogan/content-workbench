@@ -1,22 +1,35 @@
 """Markdown → the DraftJS content state that X's Articles API takes.
 
-Mapping: ``##``/``###``/``####`` → header-one/two/three, paragraphs → unstyled,
+Mapping: ``##`` → header-one, ``###``/``####`` → header-two (X Articles have two
+heading levels; a header-three block makes the draft endpoint answer 503), paragraphs → unstyled,
 list items → (un)ordered-list-item, quotes → blockquote, ``**`` / ``==`` /
-``*`` → bold / bold / italic ranges (X has no highlight), links and bare URLs → link entities, a picture → an
-atomic image block, ``---`` → divider, code and tables → a markdown entity.
-Offsets are UTF-16 code units, as in DraftJS."""
+``*`` → bold / bold / italic ranges (X has no highlight), links and bare URLs → link entities, a picture or a
+video → an atomic media block, ``---`` → divider, code and tables → a markdown entity.
+Offsets are UTF-16 code units, as in DraftJS.
+
+The Articles API has no video entity: a video goes in the same ``image`` entity
+with ``media_category: tweet_video`` (what x.com's own editor stores; a draft
+made this way plays in the editor, checked 2026-10-27).
+
+An Article holds at most 25 pictures and videos together: the x.com editor won't
+take a 26th, and the API refuses a draft with more with a 400 that only says
+"The specified article could not be found" (checked 2026-11-06)."""
 
 from __future__ import annotations
 
 import re
-from typing import Callable
+from typing import Callable, Union
 
 from .textutil import markdown_parser
 
 _md = markdown_parser()
-URL_RE = re.compile(r"https?://[^\s<>()（），。、]+")
+URL_RE = re.compile(r"https?://[^\s<>()（），。、【】「」《》“”]+")  # a bare link ends at Chinese punctuation and brackets
+MEDIA_RE = re.compile(r"!\[[^\]]*\]\([^)\s]+\)")
+MAX_MEDIA = 25
 # The body's own headings start at ##; the title is separate.
-HEADERS = {"h1": "header-one", "h2": "header-one", "h3": "header-two"}
+HEADERS = {"h1": "header-one", "h2": "header-one", "h3": "header-two", "h4": "header-two"}
+# resolve(src) → an uploaded X media id (a picture), or (media id, media_category)
+Resolver = Callable[[str], Union[str, tuple[str, str]]]
 
 
 def u16(text: str) -> int:
@@ -24,10 +37,10 @@ def u16(text: str) -> int:
 
 
 class _Builder:
-    def __init__(self, resolve_image: Callable[[str], str]):
+    def __init__(self, resolve_media: Resolver):
         self.blocks: list[dict] = []
         self.entities: list[dict] = []
-        self.resolve_image = resolve_image
+        self.resolve_media = resolve_media
 
     def entity(self, kind: str, mutability: str, data: dict) -> int:
         self.entities.append({"key": str(len(self.entities)), "value": {"type": kind, "mutability": mutability, "data": data}})
@@ -85,21 +98,28 @@ class _Builder:
                 link = None
             elif t == "image":
                 flush()
-                media_id = self.resolve_image(str(tok.attrGet("src") or ""))
+                got = self.resolve_media(str(tok.attrGet("src") or ""))
+                media_id, category = (got, "tweet_image") if isinstance(got, str) else got
                 caption = "".join(c.content for c in (tok.children or []) if c.type == "text").strip()
-                data = {"media_items": [{"media_category": "tweet_image", "media_id": media_id}]}
+                data = {"media_items": [{"media_category": category, "media_id": media_id}]}
                 if caption:
                     data["caption"] = caption
                 self.atomic("image", "immutable", data)
         flush()
 
 
-def content_state(markdown: str, resolve_image: Callable[[str], str]) -> dict:
-    """``resolve_image(src)`` returns an uploaded X media id for a picture in the body."""
+def media_count(markdown: str) -> int:
+    """Pictures and videos in the body, each time one appears (each is its own media block)."""
+    return len(MEDIA_RE.findall(markdown))
+
+
+def content_state(markdown: str, resolve_media: Resolver) -> dict:
+    """``resolve_media(src)`` returns the uploaded X media id for a picture in the
+    body, or ``(media id, media_category)`` (a video is ``tweet_video``)."""
     source = markdown.replace("\r\n", "\n")
     lines = source.split("\n")
     tokens = _md.parse(source)
-    b = _Builder(resolve_image)
+    b = _Builder(resolve_media)
     lists: list[str] = []
     quote = 0
     heading = None
@@ -120,7 +140,7 @@ def content_state(markdown: str, resolve_image: Callable[[str], str]) -> dict:
         elif t == "blockquote_close":
             quote -= 1
         elif t == "heading_open":
-            heading = HEADERS.get(tok.tag, "header-three")
+            heading = HEADERS.get(tok.tag, "header-two")
         elif t == "heading_close":
             heading = None
         elif t == "inline":
@@ -130,6 +150,9 @@ def content_state(markdown: str, resolve_image: Callable[[str], str]) -> dict:
             b.atomic("divider", "immutable", {})
         elif t in ("fence", "code_block", "table_open"):
             start, end = tok.map or (0, 0)
-            b.atomic("markdown", "mutable", {"markdown": "\n".join(lines[start:end]).strip()})
+            block = "\n".join(lines[start:end]).strip()
+            if t == "table_open":  # X has no highlight: bold, as in the rest of the article
+                block = re.sub(r"==(?=\S)(.+?)(?<=\S)==", r"**\1**", block)
+            b.atomic("markdown", "mutable", {"markdown": block})
             in_table = t == "table_open"  # its cells arrive as inline tokens; skip to table_close
     return {"blocks": b.blocks, "entities": b.entities}

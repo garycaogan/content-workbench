@@ -3,10 +3,10 @@
 import json
 
 from content_workbench import db, feishu, jobs, llm
-from content_workbench.textutil import wechat_html
+from content_workbench.textutil import digest, wechat_html
 from content_workbench.xarticle import content_state
 
-from test_app import client, login
+from test_app import client, login, save
 from test_longform import H, new_longform, png, upload
 
 
@@ -16,7 +16,7 @@ def test_highlight_and_headings_on_each_platform():
     assert html.count("background:#fff0a6") == 2 and "<mark>" not in html and "x == y" in html
     assert "<h4" in html and "<h3" in html
     state = content_state(md, lambda s: "m")
-    assert [b["type"] for b in state["blocks"]] == ["header-one", "header-two", "header-three", "unstyled"]
+    assert [b["type"] for b in state["blocks"]] == ["header-one", "header-two", "header-two", "unstyled"]  # X has two levels
     styles = {s["style"] for s in state["blocks"][3]["inline_style_ranges"]}
     assert styles == {"bold"}  # X has no highlight
 
@@ -32,6 +32,22 @@ def test_feishu_segments_keep_order_and_valid_nesting():
     assert '<b><span background-color="light-yellow">高亮</span></b>' in first  # span innermost
     assert '<a href="https://a.com">链接</a>' in segs[2][1] and "<ul><li>第一</li>" in segs[2][1]
     assert "<blockquote><p>引用</p></blockquote>" in segs[2][1]
+
+
+def test_feishu_pictures_inside_lists_and_quotes_are_real_images():
+    # the editor sometimes indents a picture into the list item above it
+    md = ("开头\n\n- 一个双人号；\n  ![](/api/images/117)\n- 一个游戏号\n\n"
+          "1. 第一步\n2. ![](/api/images/8)\n3. 第三步\n\n"
+          "> 引用一句\n>\n> ![](/api/images/9)\n>\n> 再一句\n\n"
+          "- 外部的图 ![](https://a.com/x.png)\n\n结尾")
+    segs = feishu.segments(md)
+    assert [k for k, _ in segs] == ["xml", "image", "xml", "image", "xml", "image", "xml"]
+    assert [v for k, v in segs if k == "image"] == [117, 8, 9]
+    assert segs[0][1] == "<p>开头</p><ul><li>一个双人号；</li></ul>"
+    assert segs[2][1] == "<ul><li>一个游戏号</li></ul><ol><li>第一步</li></ol>"
+    assert segs[4][1] == "<ol><li>第三步</li></ol><blockquote><p>引用一句</p></blockquote>"
+    assert segs[6][1] == "<blockquote><p>再一句</p></blockquote><ul><li>外部的图 [图片]</li></ul><p>结尾</p>"
+    assert "[图片]" not in "".join(v for k, v in segs[:6] if k == "xml")
 
 
 class FakeLark:
@@ -52,12 +68,31 @@ class FakeLark:
         return {"ok": True, "data": {}}
 
 
+def test_tables_on_each_platform():
+    md = "开头\n\n| 方案 | 价格 |\n|:---|---:|\n| **方案 A** | ==0.36 元== |\n| 年付 \\| 季付 |  |\n\n结尾"
+    # Feishu: real cells with their formatting; the escaped pipe stays inside its cell
+    (kind, xml), = feishu.segments(md)
+    assert kind == "xml" and "<table><thead><tr><th>方案</th><th>价格</th></tr></thead><tbody>" in xml
+    assert '<tr><td><b>方案 A</b></td><td><span background-color="light-yellow">0.36 元</span></td></tr>' in xml
+    assert "<tr><td>年付 | 季付</td><td></td></tr>" in xml
+    # 公众号: an aligned column keeps its borders
+    html = wechat_html(md)
+    assert '<td style="border:1px solid #ddd;padding:6px;text-align:right"><span style="background:#fff0a6' in html
+    # X: one markdown block, highlight as bold
+    state = content_state(md, lambda s: "m")
+    assert [b["type"] for b in state["blocks"]] == ["unstyled", "atomic", "unstyled"]
+    table = state["entities"][0]["value"]["data"]["markdown"]
+    assert table.startswith("| 方案 | 价格 |\n|:---|---:|") and "| **0.36 元** |" in table and "==" not in table
+    # the 公众号 summary fallback reads a table as words
+    assert digest("| 方案 | 价格 |\n|---|---|\n| A | 1 元 |\n\n后面") == "方案 价格 A 1 元 后面"
+
+
 def test_one_doc_per_draft_updated_in_place_and_conflicts_stop(monkeypatch):
     c = client()
     login(c)
     did = new_longform(c)
     pic, = upload(c, did, png())
-    c.put(f"/api/drafts/{did}", json={"body": f"第一段\n\n![](/api/images/{pic})\n\n第二段"}, headers=H)
+    save(c, did, {"body": f"第一段\n\n![](/api/images/{pic})\n\n第二段"}, headers=H)
     lark = FakeLark()
     monkeypatch.setattr(feishu, "_lark", lark)
     assert feishu.sync(did)["state"] == "ok"
@@ -68,13 +103,13 @@ def test_one_doc_per_draft_updated_in_place_and_conflicts_stop(monkeypatch):
     assert ["--parent-token", "fold1"] == lark.calls[1][lark.calls[1].index("--parent-token"):][:2]
 
     lark.calls.clear()
-    c.put(f"/api/drafts/{did}", json={"body": "改过了"}, headers=H)
+    save(c, did, {"body": "改过了"}, headers=H)
     assert feishu.sync(did)["state"] == "ok"
     kinds = [a[1] for a in lark.calls]
     assert "+create" not in kinds and ["docs", "+update"] == lark.calls[1][:2] and "overwrite" in lark.calls[1]
 
     lark.rev += 5  # someone edited the doc in Feishu
-    c.put(f"/api/drafts/{did}", json={"body": "又改了"}, headers=H)
+    save(c, did, {"body": "又改了"}, headers=H)
     lark.calls.clear()
     assert feishu.sync(did)["state"] == "conflict"
     assert not any("overwrite" in a for a in lark.calls)
@@ -98,7 +133,7 @@ def test_pending_waits_for_edits_and_skips_failed_until_changed(monkeypatch):
         pass
     assert db.row("SELECT feishu_state FROM drafts WHERE id=?", (did,))["feishu_state"] == "failed"
     assert did not in feishu.pending(min_idle=-10)
-    c.put(f"/api/drafts/{did}", json={"body": "正文改了"}, headers=H)
+    save(c, did, {"body": "正文改了"}, headers=H)
     assert did in feishu.pending(min_idle=-10)
 
 

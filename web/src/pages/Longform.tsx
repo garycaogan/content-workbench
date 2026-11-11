@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, type CaseSearch, type Draft, type DraftImage, type Status } from '../api'
+import { api, ApiError, type CaseSearch, type Draft, type DraftClip, type DraftImage, type Publication, type Status } from '../api'
 import { go } from '../App'
 import { ago, AutoTextarea, Dialog, usePoll, useToast } from '../ui'
 import * as Ic from '../icons'
@@ -16,6 +16,35 @@ export function referencedImages(body: string): number[] {
 /** Text in 【】 that still needs the author's own words before it goes out. */
 export function placeholders(body: string): string[] {
   return [...body.matchAll(/【[^】\n]{0,80}】/g)].map(m => m[0])
+}
+
+/** Videos in the body, ``![说明](/api/clips/N)``, in order. */
+export function referencedClips(body: string): number[] {
+  const seen: number[] = []
+  for (const m of body.matchAll(/!\[[^\]]*\]\(\/api\/clips\/(\d+)\)/g)) { const n = Number(m[1]); if (!seen.includes(n)) seen.push(n) }
+  return seen
+}
+
+// Under the Cloudflare gateway's 100 MB per request, and small enough to retry cheaply
+const CLIP_PIECE = 8 * 1024 * 1024
+
+/** Upload one video in pieces; the server then makes it playable (state "processing"). */
+export async function uploadClip(draftId: number, file: File, onProgress: (share: number) => void): Promise<DraftClip> {
+  const clip = await api.post<DraftClip>(`/api/drafts/${draftId}/clips`, { name: file.name, size: file.size })
+  for (let off = 0; off < file.size; off += CLIP_PIECE) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await api.putBytes(`/api/clips/${clip.id}/data?offset=${off}`, file.slice(off, off + CLIP_PIECE))
+        break
+      } catch (e) {
+        // a piece that arrived but whose answer got lost is accepted again; a 400 is a real refusal
+        if (attempt >= 4 || (e instanceof ApiError && e.status === 400)) throw e
+        await new Promise(r => window.setTimeout(r, 1500 * attempt))
+      }
+    }
+    onProgress(Math.min(1, (off + CLIP_PIECE) / file.size))
+  }
+  return api.post<DraftClip>(`/api/clips/${clip.id}/finish`)
 }
 
 export async function uploadImages(draftId: number, files: File[]): Promise<DraftImage[]> {
@@ -152,39 +181,132 @@ export function FeedCard({ draft, title, summary, body }: { draft: Draft; title:
 }
 
 type Target = 'wechat' | 'x_article' | 'zsxq'
+/** What a push reports back about the videos in the body. */
+type PushResult = { video_frames?: number }
+/** The long-form platforms, in the order 一键推送 goes through them (the server keeps the same order).
+ * duplicates: pushing again adds a second draft over there instead of updating the first. */
+const PLATFORMS: { id: Target; name: string; duplicates: boolean; next: string }[] = [
+  { id: 'wechat', name: '公众号草稿箱', duplicates: true, next: '去手机上检查后点发表' },
+  { id: 'x_article', name: 'X 长文草稿', duplicates: true, next: '去 X 上检查后点发布' },
+  { id: 'zsxq', name: '星球草稿箱', duplicates: false, next: '去星球里检查后点发布' },
+]
+/** One platform of a 一键推送, as its publications row reports it. */
+type Outcome = { state: string; stage?: string; error?: string }
 
-export function PublishLongform({ open, draft, body, status, onClose, onSent }: {
+export function PublishLongform({ open, draft, body, status, onClose, onSent, onPushed }: {
   open: boolean; draft: Draft; body: string; status: Status | null; onClose: () => void; onSent: (target: Target) => void
+  /** a 一键推送 landed: the publications list has changed */
+  onPushed: () => void
 }) {
   const toast = useToast()
-  const [target, setTarget] = useState<Target>('wechat')
+  const [target, setTarget] = useState<Target | 'all'>('all')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  const [progress, setProgress] = useState('')
   const [xName, setXName] = useState<string | null>(null)
+  const [picked, setPicked] = useState<Target[] | null>(null)  // null: every ready platform not pushed yet
+  const [outcomes, setOutcomes] = useState<Partial<Record<Target, Outcome>>>({})
   useEffect(() => {
     if (!open) return
-    setErr('')
+    setErr(''); setPicked(null)
+    setOutcomes(o => (Object.values(o).some(x => x?.state === 'pending') ? o : {}))
     api.get<{ x_account: { username?: string; subscription_type?: string } | null }>('/api/settings')
       .then(s => setXName(s.x_account ? `@${s.x_account.username}${s.x_account.subscription_type ? ` · ${s.x_account.subscription_type}` : ''}` : null)).catch(() => {})
   }, [open])
 
   const pics = referencedImages(body).length
+  const vids = referencedClips(body)
+  const [clipInfo, setClipInfo] = useState<Record<number, DraftClip>>({})
+  const vidKey = vids.join(',')
+  useEffect(() => {
+    if (!open || !vidKey) return
+    Promise.all(vidKey.split(',').map(n => api.get<DraftClip>(`/api/clips/${n}/info`).catch(() => null)))
+      .then(list => setClipInfo(Object.fromEntries(list.filter(Boolean).map(c => [c!.id, c!]))))
+  }, [open, vidKey])
+  const vidsWaiting = vids.filter(n => clipInfo[n] && clipInfo[n].state !== 'ready').length
+  const vidsLinked = vids.filter(n => clipInfo[n]?.link).length
   const holes = placeholders(body)
   const wxCover = draft.cover_wechat ? 'this' : status?.wechat_cover ? 'default' : 'none'
   const xCover = draft.cover_x ? 'x' : draft.cover_wechat ? 'wechat' : 'none'
-  const needsMedia = pics > 0 || xCover !== 'none'
+  const needsMedia = pics > 0 || vids.length > 0 || xCover !== 'none'
   const wxReady = !!status?.wechat_configured && wxCover !== 'none'
   const xReady = !!status?.x_connected && (!needsMedia || !!status?.x_media) && !!draft.title.trim()
   const zsxqReady = !!status?.zsxq_connected && !!status?.zsxq_group && !!draft.title.trim() && draft.title.trim().length <= 60
-  const ready = target === 'wechat' ? wxReady : target === 'zsxq' ? zsxqReady : xReady
+  const readyOf: Record<Target, boolean> = { wechat: wxReady, x_article: xReady, zsxq: zsxqReady }
+  // why a platform can't be pushed yet, and whether 设置 is where to fix it
+  const blocked: Record<Target, [string, boolean] | null> = {
+    wechat: !status?.wechat_configured ? ['公众号还没配好，去设置', true] : wxCover === 'none' ? ['没有封面，先在“封面·配图”里选一张', false] : null,
+    x_article: !status?.x_connected ? ['X 还没连接，去设置', true] : needsMedia && !status?.x_media ? ['这次要传图，去设置里点一次“重新连接”', true]
+      : !draft.title.trim() ? ['长文必须有标题', false] : null,
+    zsxq: !status?.zsxq_connected ? ['还没连接，去设置里扫码', true] : !status?.zsxq_group ? ['还没填星球编号，去设置里填', true]
+      : !draft.title.trim() ? ['要有标题', false] : draft.title.trim().length > 60 ? [`星球标题最多 60 个字，现在 ${draft.title.trim().length} 个`, false] : null,
+  }
+  const summaryOf: Record<Target, string> = {
+    wechat: wxCover === 'this' ? '已连接，用这篇选的封面' : '已连接，用默认封面',
+    x_article: xName || '已连接',
+    zsxq: `存进「${status?.zsxq_group || ''}」`,
+  }
+  const lastSent = (t: Target) => (draft.publications || []).find(p => p.platform === t && p.state === 'sent')
+  const chosen = picked ?? PLATFORMS.filter(p => readyOf[p.id] && !lastSent(p.id)).map(p => p.id)
+  const ready = (target === 'all' ? chosen.length > 0 && chosen.every(t => readyOf[t]) : readyOf[target]) && vidsWaiting === 0
 
-  async function send() {
+  function toggle(t: Target) {
+    setPicked(chosen.includes(t) ? chosen.filter(x => x !== t) : PLATFORMS.map(p => p.id).filter(x => x === t || chosen.includes(x)))
+  }
+
+  /** 一键推送: the server pushes them one after another in the background; follow each platform's own row. */
+  async function pushAll(targets: Target[]) {
+    const again = PLATFORMS.filter(p => targets.includes(p.id) && p.duplicates && lastSent(p.id))
+    if (again.length && !window.confirm(`${again.map(p => p.name).join('、')}之前已经推过，再推会在那边多出一份草稿。确定再推？`)) return
     setBusy(true); setErr('')
     try {
-      await api.post(`/api/drafts/${draft.id}/publish`, { confirm: true, target })
-      toast(target === 'wechat' ? '已推到公众号草稿箱，去手机上检查后点发表' : target === 'zsxq' ? '已存进星球的文章草稿箱，去星球里检查后点发布' : '已建好 X 长文草稿，去 X 上检查后点发布')
-      onSent(target)
+      const r = await api.post<{ publications: { target: Target; publication_id: number }[] }>(`/api/drafts/${draft.id}/publish-all`,
+        { confirm: true, targets })
+      setOutcomes(o => ({ ...o, ...Object.fromEntries(r.publications.map(p => [p.target, { state: 'pending', stage: '排队中' }])) }))
+      await Promise.all(r.publications.map(p => track(p.target, p.publication_id)))
+      setPicked([])
+      onPushed()
     } catch (e) { setErr((e as Error).message) } finally { setBusy(false) }
+  }
+
+  async function track(t: Target, pid: number) {
+    for (;;) {
+      await new Promise(r => window.setTimeout(r, 1500))
+      let p: Publication & { stage?: string; pct?: number }
+      try { p = await api.get(`/api/publications/${pid}`) } catch { continue }  // a dropped poll is retried
+      const detail = JSON.parse(p.detail || '{}') as { error?: string }
+      setOutcomes(o => ({ ...o, [t]: { state: p.state, stage: p.stage ? `${p.stage}${p.pct ? ` ${p.pct}%` : ''}` : undefined, error: detail.error } }))
+      if (p.state !== 'pending') return
+    }
+  }
+
+  /** An X article with videos is pushed in the background; follow it until it lands. */
+  /** A push with videos runs in the background; follow it until it lands and return what it reported. */
+  async function follow(pid: number): Promise<PushResult> {
+    for (;;) {
+      await new Promise(r => window.setTimeout(r, 2000))
+      const p = await api.get<Publication & { stage?: string; pct?: number }>(`/api/publications/${pid}`)
+      if (p.state !== 'pending') {
+        const detail = JSON.parse(p.detail || '{}') as PushResult & { error?: string }
+        if (p.state === 'sent') return detail
+        throw new Error(detail.error || (p.state === 'unknown' ? '结果不确定，去草稿箱里看一眼再决定要不要重推' : '没推上去'))
+      }
+      setProgress(p.stage ? `${p.stage}${p.pct ? ` ${p.pct}%` : ''}` : '正在推')
+    }
+  }
+
+  async function send() {
+    if (target === 'all') return pushAll(chosen)
+    setBusy(true); setErr(''); setProgress('')
+    try {
+      let res = await api.post<PushResult & { pending?: boolean; publication_id?: number }>(`/api/drafts/${draft.id}/publish`, { confirm: true, target })
+      if (res.pending && res.publication_id) res = await follow(res.publication_id)
+      const wxNote = res.video_frames ? `。正文里的 ${res.video_frames} 段视频在草稿里是一帧画面加一段黄色提示，照着在公众号编辑器里本地上传换上` : ''
+      const zsxqNote = res.video_frames ? `。正文里的 ${res.video_frames} 段视频在星球里是一帧画面${vidsLinked ? '，填了观看链接的下面有一行「看视频」' : ''}` : ''
+      toast(target === 'wechat' ? `已推到公众号草稿箱，去手机上检查后点发表${wxNote}` : target === 'zsxq' ? `已存进星球的文章草稿箱，去星球里检查后点发布${zsxqNote}`
+        : '已建好 X 长文草稿，去 X 上检查后点发布')
+      onSent(target)
+    } catch (e) { setErr((e as Error).message) } finally { setBusy(false); setProgress('') }
   }
 
   const Line = ({ ok, warn, label, children }: { ok?: boolean; warn?: boolean; label: string; children: React.ReactNode }) => (
@@ -194,23 +316,67 @@ export function PublishLongform({ open, draft, body, status, onClose, onSent }: 
     </div>
   )
 
+  const wechatVideoLine = vids.length > 0 && (
+    <Line ok={false} warn label="正文视频">{`${vids.length} 段。公众号接口传的视频只能用在自动回复和菜单里，放不进文章，所以草稿里原位置是一帧画面加一段黄色提示，写着要传哪个文件。在公众号编辑器里点那张图删掉，从「视频 → 本地上传」把这个文件传上去（工作台正文里点「下载」也能拿到），审核通过后就能发。`}</Line>
+  )
+  const zsxqVideoLine = vids.length > 0 && (
+    <Line ok={false} warn label="正文视频">{`${vids.length} 段。星球文章放不了视频（星球编辑器本身也没有视频按钮），草稿里是视频的一帧画面。`
+      + (vidsLinked ? `其中 ${vidsLinked} 段填了观看链接，画面下面会多一行「看视频」。` : '想让读者能看，在正文视频上点「加观看链接」，画面下面会多一行「看视频」。')}</Line>
+  )
+
+  const outcomeLine = (p: typeof PLATFORMS[number], o: Outcome) => (
+    o.state === 'pending' ? <span className="row muted"><Ic.Loader size={12} /> {o.stage || '排队中'}</span>
+      : o.state === 'sent' ? <span className="push-ok">已推上，{p.next}</span>
+      : o.state === 'unknown' ? <span className="push-warn">结果不确定{o.error ? `：${o.error}` : ''}。先去{p.name}里看一眼，没有再重推</span>
+      : <span className="err">没推上：{o.error || '原因不明'}</span>
+  )
+
   return (
     <Dialog open={open} onClose={onClose} title="推到草稿箱" wide footer={<>
-      <button className="btn" onClick={onClose} disabled={busy}>再改改</button>
+      <button className="btn" onClick={onClose} disabled={busy && target !== 'all'}>{busy && target === 'all' ? '关掉，后台接着推' : '再改改'}</button>
       <button className="btn primary" onClick={send} disabled={busy || !ready}>{busy ? <Ic.Loader size={15} /> : <Ic.Send size={15} />}
-        {target === 'wechat' ? ' 推到公众号草稿箱' : target === 'zsxq' ? ' 存进星球草稿箱' : ' 推到 X 长文草稿'}</button>
+        {target === 'all' ? ` 一键推到 ${chosen.length} 个平台` : target === 'wechat' ? ' 推到公众号草稿箱' : target === 'zsxq' ? ' 存进星球草稿箱' : ' 推到 X 长文草稿'}</button>
     </>}>
       <div className="stack">
-        <div className="segmented" role="group" aria-label="发到哪里">
+        <div className="segmented push-targets" role="group" aria-label="发到哪里">
+          <button aria-pressed={target === 'all'} onClick={() => setTarget('all')}><Ic.Send size={12} /> 一键推送全平台</button>
           <button aria-pressed={target === 'wechat'} onClick={() => setTarget('wechat')}><Ic.WechatLogo size={13} /> 公众号草稿箱</button>
           <button aria-pressed={target === 'x_article'} onClick={() => setTarget('x_article')}><Ic.XLogo size={11} /> X 长文草稿</button>
           <button aria-pressed={target === 'zsxq'} onClick={() => setTarget('zsxq')}>星 星球草稿箱</button>
         </div>
-        {target === 'zsxq' ? (
+        {target === 'all' ? (
+          <div className="checks">
+            {PLATFORMS.map(p => {
+              const why = blocked[p.id], sent = lastSent(p.id), o = outcomes[p.id]
+              return (
+                <div key={p.id} className="push-row">
+                  <label className="push-pick">
+                    <input type="checkbox" checked={chosen.includes(p.id)} disabled={!!why || busy} onChange={() => toggle(p.id)} />
+                    <b>{p.name}</b>
+                  </label>
+                  <span className="push-info">
+                    {o ? outcomeLine(p, o)
+                      : why ? (why[1] ? <a onClick={() => go('settings')}>{why[0]}</a> : <span className="err">{why[0]}</span>)
+                      : sent ? <span className="push-warn">已经推过（{ago(sent.created_at)}），{p.duplicates ? '再推会在那边多出一份草稿' : '再推会更新同一篇草稿，不会多出一篇'}</span>
+                      : <span className="muted">{summaryOf[p.id]}</span>}
+                  </span>
+                  {o && (o.state === 'failed' || o.state === 'unknown') && !busy && !why && (
+                    <button className="btn ghost sm" onClick={() => pushAll([p.id])}>{o.state === 'failed' ? '重试' : '确认没有，重推'}</button>
+                  )}
+                </div>
+              )
+            })}
+            {vids.length > 0 && (
+              <Line ok={false} warn label="正文视频">{`${vids.length} 段。X 长文里能直接播放（传视频要多等几分钟）；公众号和星球放不进视频，草稿里是一帧画面，公众号那边要自己换上，点上面单个平台能看详细说明。`}</Line>
+            )}
+            <div className="callout info"><Ic.Alert size={15} /><span>这几个平台都只存草稿，不会发布、不会群发：公众号放进草稿箱，X 建一篇长文草稿，星球存进「我的文章-草稿箱」。按顺序一个一个推，一个没推上不影响别的，没推上的可以单独重试。推的时候可以关掉这个窗口，结果也记在右边“记录”里。</span></div>
+          </div>
+        ) : target === 'zsxq' ? (
           <div className="checks">
             <Line ok={!!status?.zsxq_connected && !!status?.zsxq_group} label="知识星球">{!status?.zsxq_connected ? <a onClick={() => go('settings')}>还没连接，去设置里扫码</a> : !status?.zsxq_group ? <a onClick={() => go('settings')}>还没填星球编号，去设置里填</a> : `已连接，存进「${status.zsxq_group}」的文章草稿箱`}</Line>
             <Line ok={!!draft.title.trim() && draft.title.trim().length <= 60} label="标题">{draft.title.trim().length > 60 ? `星球标题最多 60 个字，现在 ${draft.title.trim().length} 个` : draft.title.trim() || '要有标题'}</Line>
             <Line ok label="正文图片">{pics ? `${pics} 张，推的时候自动传到星球` : '没有'}</Line>
+            {zsxqVideoLine}
             <Line ok label="排版">标题、加粗、列表、引用都带过去；星球文章没有高亮，高亮会变成加粗</Line>
             <div className="callout info"><Ic.Alert size={15} /><span>只存进星球的「我的文章-草稿箱」，不会发布。再推一次会更新同一篇草稿，不会多出一篇。去星球网页或 App 里看一遍再点发布。</span></div>
           </div>
@@ -222,6 +388,7 @@ export function PublishLongform({ open, draft, body, status, onClose, onSent }: 
                 : wxCover === 'default' ? '没选，用设置里的默认封面' : '没有封面，先在“封面·配图”里选一张'}
             </Line>
             <Line ok label="正文图片">{pics ? `${pics} 张，推的时候自动传到公众号` : '没有'}</Line>
+            {wechatVideoLine}
             <Line ok label="摘要">{draft.summary?.trim() || '没填，自动取正文开头'}</Line>
             <Line ok label="阅读原文">{draft.source_url || '不设'}</Line>
             <div className="callout info"><Ic.Alert size={15} /><span>只放进草稿箱，不会群发。之后在手机“公众号助手”或电脑后台再看一遍，点发表。重复推会在草稿箱里多出一篇。</span></div>
@@ -238,12 +405,17 @@ export function PublishLongform({ open, draft, body, status, onClose, onSent }: 
                 : xCover === 'wechat' ? '没单独选，用公众号封面' : '不带封面'}
             </Line>
             <Line ok label="正文图片">{pics ? `${pics} 张，推的时候自动传到 X` : '没有'}</Line>
+            {vids.length > 0 && <Line ok label="正文视频">{`${vids.length} 段，推的时候传到 X，在长文里能直接播放。视频要传一会儿，可以关掉这个窗口，结果记在推送记录里`}</Line>}
             <div className="callout info"><Ic.Alert size={15} /><span>在 X 上建一篇长文草稿，不会公开发出。去 X 的长文草稿里看一遍再点发布。X 长文要求账号开通 Premium，接口按次计费，从开发者后台余额里扣。</span></div>
           </div>
         )}
         {holes.length > 0 && (
           <div className="callout"><Ic.Alert size={15} /><span>正文里还有 {holes.length} 处【】没补：{holes[0].slice(0, 40)}{holes.length > 1 ? ' 等' : ''}。推进草稿箱后也可以再改。</span></div>
         )}
+        {vidsWaiting > 0 && (
+          <div className="callout"><Ic.Alert size={15} /><span>还有 {vidsWaiting} 段视频没处理好，等正文里的视频能播放了再推。</span></div>
+        )}
+        {busy && progress && <div className="row small muted"><Ic.Loader size={13} /> {progress}</div>}
         {err && <div className="err">{err}</div>}
       </div>
     </Dialog>

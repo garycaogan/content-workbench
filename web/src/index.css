@@ -550,6 +550,15 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .check-line .ck.ok { background: var(--ok-soft); color: var(--ok); }
 .check-line .ck.warn { background: var(--warn-soft); color: var(--warn); }
 .check-line .ck.bad { background: var(--danger-soft); color: var(--danger); }
+.push-targets { flex-wrap: wrap; align-self: flex-start; }
+.push-targets button { white-space: nowrap; }
+.push-row { display: grid; grid-template-columns: 132px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 8px 0; font-size: 13.5px; border-bottom: 1px solid var(--border); }
+.push-pick { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.push-pick input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
+.push-info { min-width: 0; line-height: 1.55; }
+.push-ok { color: var(--ok); }
+.push-warn { color: var(--warn); }
+@media (max-width: 560px) { .push-row { grid-template-columns: minmax(0, 1fr) auto; } .push-info { grid-column: 1 / -1; grid-row: 2; } }
 .check-line .lb { color: var(--muted); }
 .check-line .vl { min-width: 0; overflow-wrap: anywhere; }
 .check-line a { color: var(--accent-text); cursor: pointer; text-decoration: underline; }
@@ -584,7 +593,24 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .rich-body hr { border: none; border-top: 1px solid var(--border); margin: 1.6em 0; }
 .rich-body img { display: block; max-width: 100%; height: auto; margin: 1.2em auto; border-radius: 6px; border: 1px solid var(--border); }
 .rich-body img.ProseMirror-selectednode { outline: 3px solid var(--accent); outline-offset: 2px; }
+.rich-body .clip { margin: 1.2em 0; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); overflow: hidden; }
+.rich-body .clip.selected, .rich-body .clip.ProseMirror-selectednode { outline: 3px solid var(--accent); outline-offset: 2px; }
+.rich-body .clip-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 12.5px; line-height: 1.5; color: var(--muted); cursor: grab; }
+.rich-body .clip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.rich-body .clip-meta { font-variant-numeric: tabular-nums; }
+.rich-body .clip-act { margin-left: auto; background: none; border: none; padding: 2px 4px; font: inherit; color: var(--accent-text); cursor: pointer; text-decoration: none; }
+.rich-body .clip-act + .clip-act { margin-left: 4px; }
+.rich-body .clip video { display: block; width: 100%; max-height: 70vh; background: #000; }
+.rich-body .clip-wait { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 160px; padding: 20px; font-size: 14px; line-height: 1.6; color: var(--muted); text-align: center; }
+.rich-body .clip-wait.bad { color: var(--danger); }
+.rich-body .clip-cap { padding: 6px 12px 8px; font-size: 13px; line-height: 1.6; color: var(--muted); text-align: center; }
 .rich-body a { color: var(--accent-text); text-decoration: underline; }
+.rich-body .tableWrapper { overflow-x: auto; margin: 0 0 1.2em; }
+.rich-body table { border-collapse: collapse; width: 100%; font-size: 15px; line-height: 1.65; }
+.rich-body th, .rich-body td { position: relative; border: 1px solid var(--border-strong); padding: 6px 10px; text-align: left; vertical-align: top; }
+.rich-body th { background: var(--surface-2); font-weight: 700; }
+.rich-body th p, .rich-body td p { margin: 0; }
+.rich-body .selectedCell::after { content: ""; position: absolute; inset: 0; background: var(--accent-soft); opacity: .6; pointer-events: none; }
 .rich-body p.is-editor-empty:first-child::before { content: attr(data-placeholder); color: var(--faint); float: left; height: 0; pointer-events: none; }
 @media (max-width: 900px) { .rich-body { font-size: 16.5px; } .rich-toolbar { top: 52px; } }
 
@@ -627,6 +653,8 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .revise-note { margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
 .revise-note > span:not(.acts) { flex: 1; min-width: 200px; }
 .revise-note .acts { display: inline-flex; gap: 2px; }
+.kept-field { flex-basis: 100%; display: flex; flex-direction: column; gap: 4px; }
+.kept-field .textarea { background: var(--surface); font-size: 13.5px; }
 .diff { font-family: var(--font-read); font-size: 15px; line-height: 1.85; }
 .diff p { margin: 0 0 12px; padding: 6px 10px; border-radius: 6px; }
 .diff .d-same { color: var(--muted); }
@@ -705,6 +733,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .vthumb { padding: 0; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--surface-2); aspect-ratio: 4 / 3; cursor: pointer; }
 .vthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .vthumb.on { outline: 2px solid var(--accent); outline-offset: 1px; }
+.vclip { width: 100%; max-height: 260px; border-radius: var(--r-md); background: #000; object-fit: contain; display: block; }
 .vfocus { position: relative; border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); cursor: crosshair; touch-action: none; user-select: none; max-height: 420px; }
 .vfocus img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
 .vfocus-box { position: absolute; border: 2.5px solid var(--accent); border-radius: 6px; box-shadow: 0 0 0 9999px rgba(15, 20, 25, .35); pointer-events: none; }
@@ -720,12 +749,17 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 .studio-top .crumb { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .studio-top .crumb .t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .studio-top .right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.studio-top .right { flex-shrink: 0; }
+.studio-top .segmented button { white-space: nowrap; }
 .studio-center { flex: 1; display: grid; place-items: center; padding: 24px 16px; overflow: auto; }
 .studio-h { font-size: 16px; font-weight: 650; margin: 0; line-height: 1.4; }
 .studio-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 280px minmax(0, 1fr) var(--pv-w); }
 
 .studio-scenes { border-right: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
 .studio-scenes-head { padding: 14px 16px 10px; color: var(--muted); }
+.studio-headline { display: flex; flex-direction: column; gap: 6px; padding: 14px 12px 12px; border-bottom: 1px solid var(--border); }
+.studio-headline .input.sm { width: 100%; height: 32px; }
+.studio-headline em { font-style: normal; margin-left: 4px; }
 .studio-scenes-head b { color: var(--text); font-weight: 600; }
 .studio-scenes ol { list-style: none; margin: 0; padding: 0 10px 12px; display: flex; flex-direction: column; gap: 6px; overflow: auto; flex: 1; min-height: 0; }
 .sc-card { display: flex; flex-direction: column; gap: 5px; width: 100%; text-align: left; padding: 9px 10px; border-radius: var(--r-md);
@@ -751,6 +785,10 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
   max-width: 100%; border-radius: 16px; overflow: hidden; background: #f6f6f3; border: 1px solid var(--border); box-shadow: var(--shadow-sm); }
 .spv-frame iframe, .spv-frame video { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; display: block; }
 .spv-frame video { background: #000; object-fit: contain; }
+.spv-frame.wide { height: auto; width: 100%; align-self: stretch; aspect-ratio: 16 / 9; }
+.studio.wide-fmt { --pv-w: 560px; }
+.studio.wide-fmt .studio-body { grid-template-columns: 250px minmax(0, 1fr) var(--pv-w); }
+.vplayer.wide { aspect-ratio: 16 / 9; }
 .spv-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; text-align: center; }
 .spv-busy { position: absolute; top: 10px; right: 10px; display: inline-flex; gap: 5px; align-items: center; padding: 3px 9px;
   border-radius: 100px; background: rgba(24, 24, 27, .72); color: #fff; font-size: 12px; }
@@ -764,6 +802,8 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
 
 @media (max-width: 1180px) {
   .studio { --pv-w: 330px; }
+  .studio.wide-fmt { --pv-w: 440px; }
+  .studio.wide-fmt .studio-body { grid-template-columns: 210px minmax(0, 1fr) var(--pv-w); }
   .studio-body { grid-template-columns: 230px minmax(0, 1fr) var(--pv-w); }
   .studio-edit-inner { padding: 18px 20px 56px; }
 }
@@ -775,6 +815,8 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
   .studio-body { display: flex; flex-direction: column; }
   .studio-preview { order: -1; border-left: 0; border-bottom: 1px solid var(--border); overflow: visible; }
   .spv-frame { height: min(58vh, 520px); }
+  .spv-frame.wide { height: auto; }
+  .studio-top .segmented button { padding: 0 9px; }
   .studio-scenes { border-right: 0; border-bottom: 1px solid var(--border); }
   .studio-scenes ol { flex-direction: row; overflow-x: auto; padding-bottom: 12px; }
   .studio-scenes li { flex: 0 0 200px; }
@@ -785,3 +827,12 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; 
   .vresult { grid-template-columns: minmax(0, 1fr); }
   .vplayer { max-height: 70vh; width: auto; margin: 0 auto; }
 }
+
+/* 视频 · 发布: title, intro and cover words, then sending the render out */
+.pub-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+.vsend { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; padding-top: 18px; border-top: 1px solid var(--border); }
+.vsend .studio-edit-head .small { margin-left: auto; }
+.vsend .pub-item:first-of-type { border-top: 1px solid var(--border); }
+.spv-frame.cover { background: var(--surface-2); }
+.spv-frame.cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+@media (max-width: 720px) { .pub-grid { grid-template-columns: 1fr; } }

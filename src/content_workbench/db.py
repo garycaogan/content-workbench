@@ -104,6 +104,28 @@ CREATE TABLE IF NOT EXISTS image_remotes (
     created_at REAL NOT NULL,
     PRIMARY KEY (image_id, target)
 );
+CREATE TABLE IF NOT EXISTS clips (    -- videos in a long-form body (clips.py)
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER REFERENCES drafts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,             -- original file name, for display
+    file TEXT NOT NULL,             -- stem inside the private clips directory (.part while uploading, then .mp4 + .jpg)
+    state TEXT NOT NULL DEFAULT 'uploading',  -- uploading | processing | ready | failed
+    error TEXT,
+    size INTEGER NOT NULL,          -- bytes of the file as picked
+    received INTEGER NOT NULL DEFAULT 0,
+    width INTEGER, height INTEGER, duration REAL,
+    bytes INTEGER,                  -- the playable MP4
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS clip_remotes (
+    clip_id INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+    target TEXT NOT NULL,           -- x_media | wx_inline | zsxq
+    remote_id TEXT,
+    url TEXT,
+    expires_at REAL,                -- X media ids expire if unused; NULL = permanent
+    created_at REAL NOT NULL,
+    PRIMARY KEY (clip_id, target)
+);
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
@@ -193,6 +215,12 @@ MIGRATIONS = {
         "last_revision": "TEXT",
         "xhs": "TEXT",                       # 小红书 version: title, body, tags, cards, picture ids
         "video": "TEXT",                     # short video: scenes (script), voice, render state, last MP4
+        # 背景资料 (Markdown): the facts the piece was written from, for the AI that revises
+        # and rewrites it; never published, not archived to Feishu
+        "context": "TEXT NOT NULL DEFAULT ''",
+    },
+    "clips": {
+        "link": "TEXT NOT NULL DEFAULT ''",   # where readers can watch it (星球 articles can't hold a video)
     },
 }
 

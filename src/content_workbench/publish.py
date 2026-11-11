@@ -30,6 +30,7 @@ X_TWEETS = "https://api.x.com/2/tweets"
 X_ME = "https://api.x.com/2/users/me"
 X_MEDIA = "https://api.x.com/2/media/upload"
 X_ARTICLE_DRAFT = "https://api.x.com/2/articles/draft"
+X_MEDIA_METADATA = "https://api.x.com/2/media/metadata"
 # media.write is needed for pictures in X Articles; tokens granted before it was
 # added have to reconnect once.
 X_SCOPES = "tweet.read tweet.write users.read media.write offline.access"
@@ -74,6 +75,8 @@ def _x_token_request(store: SecretStore, data: dict) -> dict:
         data = {**data, "client_id": client_id}
     resp = httpx.post(X_TOKEN, data=data, auth=auth, timeout=30)
     if resp.status_code != 200:
+        if data.get("grant_type") == "refresh_token" and resp.status_code in (400, 401):
+            raise PublishError("X 的授权失效了，去设置里点一次“重新连接”再发")
         raise PublishError(f"X 授权失败：{resp.status_code} {resp.text[:200]}")
     tok = resp.json()
     previous = store.get("x_tokens") or {}
@@ -149,12 +152,101 @@ def x_article_draft(store: SecretStore, title: str, content_state: dict, cover_m
     except httpx.HTTPError as exc:
         raise PublishError("推到 X 长文草稿时网络中断，结果不确定，请到 X 的长文草稿里看一眼", uncertain=True,
                            detail={"error": str(exc)}) from None
+    if resp.status_code == 429 and resp.headers.get("x-user-limit-24hour-remaining") == "0":
+        # each account may create a few Article drafts a day, failed attempts included
+        limit = resp.headers.get("x-user-limit-24hour-limit") or "10"
+        reset = int(resp.headers.get("x-user-limit-24hour-reset") or 0)
+        when = time.strftime("%m-%d %H:%M", time.localtime(reset)) if reset else "明天"
+        raise PublishError(f"X 每个账号 24 小时最多建 {limit} 次长文草稿（没建成的也算），这一轮用完了，{when} 之后能再推")
     if resp.status_code not in (200, 201):
         hint = "（X 长文需要发帖账号开通 Premium）" if resp.status_code == 403 else ""
         raise PublishError(f"推到 X 长文草稿失败：{resp.status_code} {resp.text[:300]}{hint}",
                            uncertain=resp.status_code >= 500)
     data = resp.json().get("data") or {}
     return {"article_id": data.get("id"), "url": "https://x.com/compose/articles"}
+
+
+X_VIDEO_CHUNK = 4 * 1024 * 1024  # X takes up to 5 MB per append
+# A longer video uploads and processes fine, but an Article draft holding one is refused through the API
+# (a 2:41 clip failed, 1:56 went through, 2026-11-06); x.com's own editor takes long videos.
+X_VIDEO_MAX_SECONDS = 140
+
+
+def _x_check(resp: httpx.Response, what: str) -> dict:
+    if resp.status_code not in (200, 201, 202, 204):
+        raise PublishError(f"{what}失败：{resp.status_code} {resp.text[:200]}")
+    try:
+        return resp.json().get("data") or {}
+    except ValueError:  # append answers with an empty body
+        return {}
+
+
+def x_upload_video(store: SecretStore, path: Path, progress=None) -> str:
+    """Chunked upload of an MP4 for a post (initialize, append, finalize), then wait
+    until X has processed it. Returns the media id; nothing is posted."""
+    if "media.write" not in x_scopes(store):
+        raise PublishError("X 的授权里还没有上传的权限，去设置里点一次“重新连接”就好")
+    headers = {"Authorization": f"Bearer {_x_access_token(store)}"}
+    try:
+        with path.open("rb") as f:
+            size = path.stat().st_size
+            info = _x_check(httpx.post(X_MEDIA + "/initialize", headers=headers, timeout=30,
+                                       json={"media_type": "video/mp4", "total_bytes": size, "media_category": "tweet_video"}),
+                            "视频传到 X ")
+            media_id = str(info.get("id") or "")
+            if not media_id:
+                raise PublishError("视频传到 X 没拿到编号")
+            index = 0
+            while chunk := f.read(X_VIDEO_CHUNK):
+                _x_check(httpx.post(f"{X_MEDIA}/{media_id}/append", headers=headers, timeout=180,
+                                    data={"segment_index": str(index)}, files={"media": ("chunk", chunk, "application/octet-stream")}),
+                         f"视频第 {index + 1} 段传到 X ")
+                index += 1
+                if progress:
+                    progress(min(f.tell() / max(size, 1), 1.0))
+        info = _x_check(httpx.post(f"{X_MEDIA}/{media_id}/finalize", headers=headers, timeout=60), "X 收尾视频").get("processing_info")
+        deadline = time.time() + 600
+        while info and info.get("state") in ("pending", "in_progress"):
+            if time.time() > deadline:
+                raise PublishError("X 处理这条视频太久了，过一会儿再发一次")
+            time.sleep(min(max(int(info.get("check_after_secs") or 2), 1), 15))
+            info = _x_check(httpx.get(X_MEDIA, headers=headers, params={"command": "STATUS", "media_id": media_id}, timeout=30),
+                            "查 X 的视频处理进度").get("processing_info")
+    except httpx.HTTPError as exc:
+        raise PublishError(f"视频传到 X 时网络中断：{exc}") from None
+    if info and info.get("state") == "failed":
+        err = info.get("error") or {}
+        raise PublishError(f"X 处理视频失败：{err.get('message') or err.get('name') or info}")
+    return media_id
+
+
+def x_set_video_cover(store: SecretStore, video_id: str, image_id: str) -> None:
+    """Use an uploaded picture as the video's preview image instead of a frame."""
+    payload = {"id": video_id, "metadata": {"preview_image": {"media_key": {"media": image_id, "media_category": "TweetImage"}}}}
+    try:
+        resp = httpx.post(X_MEDIA_METADATA, json=payload, headers={"Authorization": f"Bearer {_x_access_token(store)}"}, timeout=30)
+    except httpx.HTTPError as exc:
+        raise PublishError(f"封面没设上（网络中断：{exc}）") from None
+    if resp.status_code not in (200, 201):
+        raise PublishError(f"封面没设上：{resp.status_code} {resp.text[:200]}")
+
+
+def x_post_video(store: SecretStore, text: str, media_id: str) -> dict:
+    """One post carrying an uploaded video. X has no drafts for posts: this goes out."""
+    if x_weighted_length(text) > X_LIMIT:
+        raise PublishError("文字超过 X 字数上限")
+    payload: dict = {"media": {"media_ids": [media_id]}}
+    if text.strip():
+        payload["text"] = text.strip()
+    try:
+        resp = httpx.post(X_TWEETS, json=payload, headers={"Authorization": f"Bearer {_x_access_token(store)}"}, timeout=60)
+    except httpx.HTTPError as exc:
+        raise PublishError("发帖时网络中断，结果不确定，请到 X 上看一眼再决定", uncertain=True,
+                           detail={"error": str(exc)}) from None
+    if resp.status_code not in (200, 201):
+        raise PublishError(f"发帖失败：{resp.status_code} {resp.text[:200]}", uncertain=resp.status_code >= 500)
+    post_id = resp.json()["data"]["id"]
+    return {"ids": [post_id], "url": f"https://x.com/i/status/{post_id}"}
 
 
 def x_publish(store: SecretStore, body: str) -> dict:
@@ -233,6 +325,29 @@ def wx_upload_inline(store: SecretStore, data: bytes, mime: str, name: str) -> s
     if not body.get("url"):
         raise PublishError(f"正文图片上传失败：{body.get('errcode')} {body.get('errmsg')}")
     return body["url"]
+
+
+WX_VIDEO_MAX = 10 * 1024 * 1024  # what add_material takes for a video
+
+
+def wx_upload_video(store: SecretStore, path: Path, title: str, introduction: str) -> str:
+    """A video into the 素材库 as permanent material. draft/add cannot put a video
+    into an article, so the author inserts it in the editor from 素材库."""
+    if path.stat().st_size > WX_VIDEO_MAX:
+        raise PublishError("公众号接口只收 10MB 以内的视频")
+    token = _wx_token(store)
+    description = json.dumps({"title": title[:30], "introduction": introduction[:120]}, ensure_ascii=False)
+    try:
+        with path.open("rb") as f:
+            resp = httpx.post(WX_ADD_MATERIAL, params={"access_token": token, "type": "video"}, data={"description": description},
+                              files={"media": (path.name, f, "video/mp4")}, timeout=300)
+    except httpx.HTTPError as exc:
+        raise PublishError("视频传到公众号时网络中断，结果不确定，去素材库看一眼", uncertain=True,
+                           detail={"error": str(exc)}) from None
+    body = resp.json()
+    if "media_id" not in body:
+        raise PublishError(f"视频传到公众号失败：{body.get('errcode')} {body.get('errmsg')}")
+    return body["media_id"]
 
 
 def wx_draft(store: SecretStore, title: str, markdown: str, author: str, cover_media_id: str, *,

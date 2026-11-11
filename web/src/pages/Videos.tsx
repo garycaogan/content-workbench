@@ -1,18 +1,20 @@
 import { useState } from 'react'
-import { api, type VideoOverview } from '../api'
+import { api, type VideoOverview, type VideoRender } from '../api'
 import { go } from '../App'
 import { ago, Empty, usePoll, useToast } from '../ui'
 import { fmtDur } from './Video'
 import * as Ic from '../icons'
 
-const started = (r: VideoOverview) => r.scenes > 0 || !!r.status || !!r.video
+const started = (r: VideoOverview) => r.scenes > 0 || !!r.status || !!r.video || !!r.video_landscape
+const stale = (r: VideoOverview, v: VideoRender | null) => !!(v && r.edited_at && r.edited_at > v.rendered_at)
 
 function where(r: VideoOverview): { text: string; tone?: 'accent' | 'ok' | 'warn' | 'danger' } {
   if (r.status === 'planning') return { text: '正在写脚本', tone: 'accent' }
   if (r.status === 'rendering') return { text: `出片中 ${r.pct || 0}%`, tone: 'accent' }
   if (r.error) return { text: '上次失败了', tone: 'danger' }
-  if (r.video && r.edited_at && r.edited_at > r.video.rendered_at) return { text: '改过，还没重新出片', tone: 'warn' }
-  if (r.video) return { text: '已出片', tone: 'ok' }
+  if (stale(r, r.video) || stale(r, r.video_landscape)) return { text: '改过，还没重新出片', tone: 'warn' }
+  if (r.video && r.video_landscape) return { text: '横竖屏都出了', tone: 'ok' }
+  if (r.video || r.video_landscape) return { text: r.video ? '已出竖屏' : '已出横屏', tone: 'ok' }
   return { text: '还没出片' }
 }
 
@@ -50,6 +52,7 @@ export function Videos() {
                 <button key={r.id} className="list-row" onClick={() => go(`videos/${r.id}`)}>
                   <span className="vlist-thumb">
                     {r.video ? <video src={`/api/drafts/${r.id}/video.mp4?v=${Math.round(r.video.rendered_at)}#t=1`} muted playsInline preload="metadata" />
+                      : r.video_landscape ? <video src={`/api/drafts/${r.id}/video.mp4?format=landscape&v=${Math.round(r.video_landscape.rendered_at)}#t=1`} muted playsInline preload="metadata" />
                       : <Ic.Film size={16} />}
                   </span>
                   <div className="grow">
@@ -57,8 +60,8 @@ export function Videos() {
                     <div className="sub">
                       {r.status === 'rendering' ? r.stage || '排队中'
                         : r.error && !r.status ? r.error
-                          : `${r.scenes} 个镜头 · ${r.video ? fmtDur(r.video.duration) : `约 ${fmtDur(r.seconds)}`}`
-                            + (r.video ? ` · ${ago(r.video.rendered_at)} 出片` : '')}
+                          : `${r.scenes} 个镜头 · ${(r.video || r.video_landscape) ? fmtDur((r.video || r.video_landscape)!.duration) : `约 ${fmtDur(r.seconds)}`}`
+                            + ((r.video || r.video_landscape) ? ` · ${ago(Math.max(r.video?.rendered_at || 0, r.video_landscape?.rendered_at || 0))} 出片` : '')}
                     </div>
                   </div>
                   <span className={'pill' + (w.tone ? ` ${w.tone}` : '')}>

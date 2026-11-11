@@ -2,10 +2,12 @@
 
 import json
 
-from content_workbench import comments, db, learning, llm
+import pytest
+
+from content_workbench import comments, db, feishu, learning, llm, video, xhs
 from content_workbench.config import Settings
 
-from test_app import client, login
+from test_app import client, login, save
 from test_longform import H, new_longform, png, upload
 
 
@@ -50,7 +52,7 @@ def test_revise_applies_answers_and_records_the_round(monkeypatch):
     did = new_longform(c)
     pic, = upload(c, did, png())
     ai_version(did, f"开头那段。\n\n![](/api/images/{pic})\n\n结尾那段。")
-    c.put(f"/api/drafts/{did}", json={"body": f"开头那段，我改过。\n\n![](/api/images/{pic})\n\n结尾那段。"}, headers=H)
+    save(c, did, {"body": f"开头那段，我改过。\n\n![](/api/images/{pic})\n\n结尾那段。"}, headers=H)
     tid = c.post(f"/api/drafts/{did}/comments", json={"body": "结尾加一句号召", "quote": "结尾那段"}, headers=H).json()["id"]
 
     def fake(prompt, timeout=600, tools=None, max_turns=2):
@@ -83,7 +85,7 @@ def test_revise_rejected_when_pictures_disappear(monkeypatch):
     login(c)
     did = new_longform(c)
     pic, = upload(c, did, png())
-    c.put(f"/api/drafts/{did}", json={"body": f"文字\n\n![](/api/images/{pic})"}, headers=H)
+    save(c, did, {"body": f"文字\n\n![](/api/images/{pic})"}, headers=H)
     c.post(f"/api/drafts/{did}/comments", json={"body": "改短一点"}, headers=H)
     monkeypatch.setattr(llm, "run", lambda *a, **k: json.dumps({"body": "文字", "replies": []}))
     try:
@@ -124,14 +126,93 @@ def test_rounds_one_per_ai_version_and_learning(monkeypatch):
     assert "少用分号" in text and "署名用 Gary曹淦" not in text
 
 
+def test_learning_sees_every_change_of_a_heavy_edit(monkeypatch):
+    c = client()
+    login(c)
+    did = new_longform(c)
+    ai_version(did, "\n\n".join(f"第{i}段原来的写法。" for i in range(70)))
+    learning.record_round(did, "\n\n".join(f"第{i}段他改过的写法。" for i in range(70)), "publish")
+    seen = {}
+
+    def fake(prompt, timeout=600, tools=None, max_turns=2):
+        seen["prompt"] = prompt
+        return json.dumps({"lessons": [], "summary": "无"})
+    monkeypatch.setattr(llm, "run", fake)
+    learning.learn()
+    assert "第0段他改过的写法" in seen["prompt"] and "第69段他改过的写法" in seen["prompt"]
+    text = learning._rounds_text(learning.db.rows("SELECT * FROM edit_rounds WHERE draft_id=?", (did,)), budget=300)
+    assert json.loads(text)[0]["changes"] and len(json.loads(text)[0]["changes"]) < 70  # trimmed whole, still valid JSON
+
+
+def test_prompts_carry_the_whole_voice_guide(tmp_path, monkeypatch):
+    from content_workbench import prompts
+    from content_workbench.config import Settings
+    guide = tmp_path / "gary-voice.md"
+    guide.write_text("开头" + "很长的文风指南。" * 2000 + "最后一节在这里", encoding="utf-8")
+    settings = Settings.load()
+    settings.voice_guide_path = str(guide)
+    draft = {"title": "题", "body": "正文"}
+    assert "最后一节在这里" in prompts.build_revise_comments(settings, draft, "[批注 1] 针对全文\n  Gary：改", "（无）")
+
+
 def test_title_change_is_part_of_the_round_and_stale_saves_cannot_restore_notes():
     c = client()
     login(c)
     did = new_longform(c, "正文一句。\n\n【这里你补一句】")
     comments.lift_placeholders(did)
     ai_version(did, db.row("SELECT body FROM drafts WHERE id=?", (did,))["body"])
-    c.put(f"/api/drafts/{did}", json={"title": "改过的标题", "body": "正文一句。\n\n【这里你补一句】"}, headers=H)
+    save(c, did, {"title": "改过的标题", "body": "正文一句。\n\n【这里你补一句】"}, headers=H)
     assert "【" not in db.row("SELECT body FROM drafts WHERE id=?", (did,))["body"]
     rid = learning.record_round(did, db.row("SELECT body FROM drafts WHERE id=?", (did,))["body"], "manual")
     found = json.loads(db.row("SELECT changes FROM edit_rounds WHERE id=?", (rid,))["changes"])
     assert found[0] == {"kind": "title", "before": "长文", "after": "改过的标题"}
+
+
+def test_background_goes_to_the_revision_only_when_there_is_some(monkeypatch):
+    c = client()
+    login(c)
+    did = new_longform(c, "开头提到了作者。\n\n第二段话。")
+    c.post(f"/api/drafts/{did}/comments", json={"body": "贴上作者的 GitHub", "quote": "开头提到了作者"}, headers=H)
+    seen = []
+
+    def fake(prompt, **k):
+        seen.append(prompt)
+        return json.dumps({"body": "开头提到了作者。\n\n第二段话。", "replies": []})
+    monkeypatch.setattr(llm, "run", fake)
+    comments.revise(Settings(), did)
+    assert "贴上作者的 GitHub" in seen[-1] and "背景资料" not in seen[-1]
+
+    # the editor saves every field; changing only 背景资料 keeps updated_at so Feishu isn't rewritten
+    d = c.get(f"/api/drafts/{did}").json()
+    fields = {k: d[k] for k in ("title", "body", "notes", "summary", "source_url")}
+    save(c, did, {**fields, "context": "作者：示例作者，GitHub https://github.com/example"}, headers=H)
+    after = c.get(f"/api/drafts/{did}").json()
+    assert after["context"] == "作者：示例作者，GitHub https://github.com/example" and after["updated_at"] == d["updated_at"]
+    assert save(c, did, {"title": "新标题"}, headers=H).json()["updated_at"] > d["updated_at"]
+    assert c.get(f"/api/drafts/{did}").json()["context"].startswith("作者：示例作者")
+    archived = "".join(str(v) for _, v in feishu.document_segments(db.row("SELECT * FROM drafts WHERE id=?", (did,))))
+    assert "示例作者" not in archived
+
+    comments.revise(Settings(), did)
+    assert "<背景资料>\n作者：示例作者，GitHub https://github.com/example\n</背景资料>" in seen[-1]
+    assert "不要整段照搬" in seen[-1] and seen[-1].index("</稿子正文>") < seen[-1].index("<背景资料>") < seen[-1].index("<这次要处理的批注")
+
+
+def test_rewrites_of_the_article_see_the_background_too(monkeypatch):
+    c = client()
+    login(c)
+    did = new_longform(c, "正文一段。")
+    save(c, did, {"context": "时间线：10/15 晚开搭"}, headers=H)
+    seen = []
+
+    class Seen(Exception):
+        pass
+
+    def fake(prompt, **k):
+        seen.append(prompt)
+        raise Seen
+    monkeypatch.setattr(llm, "run", fake)
+    for step in (xhs.generate, video.plan, video.write_meta):
+        with pytest.raises(Seen):
+            step(Settings(), did)
+    assert len(seen) == 3 and all("<背景资料>\n时间线：10/15 晚开搭\n</背景资料>" in p for p in seen)

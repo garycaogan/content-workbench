@@ -9,7 +9,7 @@ from PIL import Image
 from content_workbench import db, feishu, llm, xhs
 from content_workbench.config import Settings
 
-from test_app import client, login
+from test_app import client, login, save
 from test_longform import H, new_longform, png, upload
 
 
@@ -18,7 +18,7 @@ def test_generate_render_edit_and_zip(monkeypatch):
     login(c)
     did = new_longform(c)
     pic, = upload(c, did, png())
-    c.put(f"/api/drafts/{did}", json={"body": f"第一段讲起因。\n\n![](/api/images/{pic})\n\n第二段讲结果。"}, headers=H)
+    save(c, did, {"body": f"第一段讲起因。\n\n![](/api/images/{pic})\n\n第二段讲结果。"}, headers=H)
 
     def fake(prompt, timeout=600, tools=None, max_turns=2):
         assert f"- {pic}：第一段讲起因。" in prompt

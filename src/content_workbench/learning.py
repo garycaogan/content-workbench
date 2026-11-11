@@ -22,6 +22,7 @@ from .config import _write_private, data_dir
 AI_ORIGINS = ("generated", "ai-revise", "ai-draft")
 IDLE_SECONDS = 30 * 60
 LEARN_EVERY = 3
+LEARN_BUDGET = 150_000  # characters of edit history per learn run, well inside the model context
 MAX_LESSONS = 30
 
 
@@ -161,6 +162,26 @@ LEARN = """下面是 {name} 在 AI 写的底稿上亲手改过的地方，以及
 """
 
 
+def _rounds_text(rounds: list[dict], budget: int = LEARN_BUDGET) -> str:
+    """Every change of every round, in order, until the budget is spent. A heavy hand edit can carry 70+
+    changes; keeping only the first few per round lost most of what the author did. Items are dropped
+    whole, never cut mid-way, so the JSON stays readable."""
+    out, used = [], 2
+    for r in rounds:
+        kept = []
+        for change in json.loads(r["changes"]):
+            size = len(json.dumps(change, ensure_ascii=False)) + 2
+            if used + size > budget:
+                break
+            kept.append(change)
+            used += size
+        if kept:
+            out.append({"draft": r["draft_id"], "changes": kept})
+        if used >= budget:
+            break
+    return json.dumps(out, ensure_ascii=False)
+
+
 def pending_rounds() -> list[dict]:
     return db.rows("SELECT * FROM edit_rounds WHERE learned=0 ORDER BY id")
 
@@ -172,8 +193,7 @@ def learn() -> dict:
         return {"summary": "没有新的改稿记录", "lessons": len(state.get("lessons", []))}
     since = state.get("learned_at") or 0
     comments = db.rows("SELECT body, quote FROM comments WHERE author='gary' AND created_at > ? ORDER BY id LIMIT 60", (since,))
-    rounds_text = json.dumps([{"draft": r["draft_id"], "changes": json.loads(r["changes"])[:15]} for r in rounds],
-                             ensure_ascii=False)[:60000]
+    rounds_text = _rounds_text(rounds)
     comments_text = "\n".join(f"- {('针对「' + c['quote'] + '」：') if c['quote'] else ''}{c['body']}" for c in comments) or "（无）"
     current = json.dumps(state.get("lessons", []), ensure_ascii=False)
     from .config import Settings

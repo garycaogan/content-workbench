@@ -273,7 +273,7 @@ REVISE_COMMENTS = """你在帮 {name} 按他的批注修改一篇稿子。稿子
 {body}
 </稿子正文>
 
-<这次要处理的批注（最后一句是 {name} 说的）>
+{context}<这次要处理的批注（最后一句是 {name} 说的）>
 {todo}
 </这次要处理的批注>
 
@@ -284,7 +284,7 @@ REVISE_COMMENTS = """你在帮 {name} 按他的批注修改一篇稿子。稿子
 怎么改：
 - 只改批注涉及的地方；批注要求调整全文的，才动全文。没提到的段落一个字都不要改。
 - {name} 在回复里亲自写的句子，原样放进正文，不要润色他的话。
-- 正文里 `![](/api/images/数字)` 这样的图片行必须原样保留（批注要求移动就移动位置，要求删才删）。
+- 正文里 `![](/api/images/数字)` 这样的图片行和 `![](/api/clips/数字)` 这样的视频行必须原样保留（批注要求移动就移动位置，要求删才删）。
 - 如果正文是 X 推文串（推文之间用单独一行 `---` 分隔），保持这种分隔，每条按 X 的计数不超过 280（中文一个字算 2）。
 - 排版照旧：小标题 `## `、`### `、`#### `，关键句 `**加粗**`，最核心的判断 `==高亮==`（全文不超过三处）。加粗或高亮以中文标点结尾、后面紧跟文字时，把标点放到符号外面。
 - 不编事实、数字、案例和他没说过的观点。需要他补充或确认的，不要写进正文（不要用【】占位），而是放进 new_comments，quote 写正文里你想挂批注的那一小段原文（纯文字，不带 Markdown 符号，40 字以内）。
@@ -296,6 +296,22 @@ REVISE_COMMENTS = """你在帮 {name} 按他的批注修改一篇稿子。稿子
 """
 
 
+CONTEXT = """<背景资料>
+{context}
+</背景资料>
+
+上面的背景资料是 {name} 写这篇稿子时整理的事实依据（人物、时间线、数字、链接、哪些能公开）。核对事实、补细节，或者批注里问到某个事实时，先在这里找。它不是正文，不要整段照搬；里面的内部信息（写明不公开的、私人安排、内部流程和工具、没公开的合作和钱数）不要写进要发出去的内容。
+
+"""
+CONTEXT_MAX = 20000
+
+
+def context_block(settings: Settings, draft: dict) -> str:
+    """The draft's 背景资料 as a prompt section; empty when there is none."""
+    text = (draft.get("context") or "").strip()
+    return CONTEXT.format(context=text[:CONTEXT_MAX], name=persona(settings)["name"]) if text else ""
+
+
 def style_lessons_text() -> str:
     from .learning import lessons_prompt
     return lessons_prompt()
@@ -303,9 +319,9 @@ def style_lessons_text() -> str:
 
 def build_revise_comments(settings: Settings, draft: dict, todo: str, others: str) -> str:
     case_line = "- 需要案例的，可以用生财 MCP 的只读工具去搜，出处写在回复里。" if case_search_on(settings) else ""
-    return REVISE_COMMENTS.format(guide=voice_guide(settings)[:6000], lessons=style_lessons_text(), title=draft["title"],
-                                  body=draft["body"], todo=todo, others=others or "（无）", case_line=case_line,
-                                  **persona(settings))
+    return REVISE_COMMENTS.format(guide=voice_guide(settings), lessons=style_lessons_text(), title=draft["title"],
+                                  body=draft["body"], context=context_block(settings, draft), todo=todo,
+                                  others=others or "（无）", case_line=case_line, **persona(settings))
 
 
 def build_extract(settings: Settings, material: dict, existing: list[str] | None = None) -> str:
@@ -335,4 +351,4 @@ def build_draft(settings: Settings, platform: str, idea: dict, material: dict | 
 
 
 def build_revise(settings: Settings, flags: list[str], draft_json: str) -> str:
-    return REVISE.format(flags="；".join(flags), guide=voice_guide(settings)[:6000], draft_json=draft_json)
+    return REVISE.format(flags="；".join(flags), guide=voice_guide(settings), draft_json=draft_json)

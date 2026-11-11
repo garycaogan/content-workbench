@@ -29,6 +29,7 @@ from .textutil import markdown_parser
 
 API = "https://api.zsxq.com/v2/"
 UPLOAD_FALLBACK = "https://upload-z1.qiniup.com"
+UPLOAD_ATTEMPTS = 3
 LOGIN_URL = "https://wx.zsxq.com/login"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
@@ -105,12 +106,25 @@ def upload_image(store: SecretStore, data: bytes, mime: str, name: str) -> tuple
         raise PublishError("知识星球没给图片上传凭证")
     zone = ((info.get("upload_zone") or {}).get("domains") or [UPLOAD_FALLBACK])[0]
     url = zone if zone.startswith("http") else f"https://{zone}"
-    try:
-        resp = httpx.post(url, data={"token": token}, files={"file": (name, data, mime)}, timeout=120,
-                          headers={"User-Agent": UA, "Origin": "https://wx.zsxq.com", "Referer": "https://wx.zsxq.com/"})
-        body = resp.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise PublishError(f"图片传到知识星球失败：{exc}") from None
+    # The image host now and then answers with an empty or HTML body; the same upload goes through on a retry.
+    body, problem = {}, ""
+    for attempt in range(UPLOAD_ATTEMPTS):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        try:
+            resp = httpx.post(url, data={"token": token}, files={"file": (name, data, mime)}, timeout=120,
+                              headers={"User-Agent": UA, "Origin": "https://wx.zsxq.com", "Referer": "https://wx.zsxq.com/"})
+        except httpx.HTTPError as exc:
+            problem = str(exc)
+            continue
+        try:
+            body = resp.json()
+        except ValueError:
+            problem = f"{resp.status_code} {resp.text[:120]}".strip()
+            continue
+        break
+    else:
+        raise PublishError(f"图片传到知识星球失败（试了 {UPLOAD_ATTEMPTS} 次）：{problem}")
     image_id = (body.get("resp_data") or {}).get("image_id")
     link = body.get("link") or (body.get("resp_data") or {}).get("link")
     if not body.get("succeeded") or not image_id or not link:

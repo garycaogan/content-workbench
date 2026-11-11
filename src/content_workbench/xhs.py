@@ -184,7 +184,7 @@ XHS = """把下面这篇 {name} 的长文改写成一篇小红书图文笔记，
 {pictures}
 </长文里的图片>
 
-要求：
+{context}要求：
 - 标题不超过 20 个字，说人话，点出读者能得到什么或者发生了什么，不要标题党，不编数字。
 - 正文不超过 1000 个字：开头一两句交代这是怎么回事，中间几个短段落讲关键内容，结尾落回读者。短段落、多换行，口吻还是 {name} 本人；表情符号最多用 3 个，不用也行。不要加“家人们”“宝子们”这种他不说的话。
 - 话题标签 5 到 8 个，不带 #，贴近内容和他的领域（{domain}）。
@@ -208,9 +208,9 @@ def _pictures(markdown: str) -> str:
 def generate(settings, draft_id: int) -> dict:
     draft = db.row("SELECT * FROM drafts WHERE id=?", (draft_id,))
     who = prompts.persona(settings)
-    prompt = XHS.format(guide=prompts.voice_guide(settings)[:5000], lessons=prompts.style_lessons_text(),
+    prompt = XHS.format(guide=prompts.voice_guide(settings), lessons=prompts.style_lessons_text(),
                         title=draft["title"], body=draft["body"][:20000], pictures=_pictures(draft["body"]),
-                        name=who["name"], domain=who["domain"])
+                        context=prompts.context_block(settings, draft), name=who["name"], domain=who["domain"])
     result = llm.extract_json(llm.run(prompt, timeout=900))
     allowed = set(images.referenced(draft["body"]))
     state = load(draft)

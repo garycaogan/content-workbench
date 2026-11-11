@@ -173,10 +173,15 @@ def wechat_html(markdown: str) -> str:
     def add_style(match: re.Match) -> str:
         tag, rest = match.group(1), match.group(2) or ""
         style = _STYLES.get(tag)
-        if not style or "style=" in rest:
+        if not style:
             return match.group(0)
+        if 'style="' in rest:  # a table column's text-align: keep it, add the borders
+            return f'<{tag}{rest.replace('style="', 'style="' + style, 1)}>'
         return f'<{tag}{rest} style="{style}">'
 
+    # the 公众号 editor turns every newline between list tags into an empty bullet
+    rendered = re.sub(r"\s+(?=</?(?:ul|ol|li)\b)", "", rendered)
+    rendered = re.sub(r"(<(?:ul|ol|li)\b[^>]*>|</li>)\s+(?=<)", r"\1", rendered)
     out = re.sub(r"<(p|h1|h2|h3|h4|blockquote|ul|ol|li|strong|em|code|table|th|td)(\s[^>]*)?>", add_style, rendered)
     # 公众号 keeps span styles more reliably than <mark>
     out = out.replace("<mark>", f'<span style="{_STYLES["mark"]}">').replace("</mark>", "</span>")
@@ -185,6 +190,9 @@ def wechat_html(markdown: str) -> str:
 
 def strip_markdown(text: str) -> str:
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+    # a table: its --- row goes, its cell borders become spaces
+    text = re.sub(r"(?m)^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-*:?\s*$", "", text)
+    text = re.sub(r"(?m)^\s*\|.*$", lambda m: re.sub(r"(?<!\\)\|", " ", m.group(0)).replace("\\|", "|"), text)
     text = re.sub(r"(?m)^#{1,6}\s*", "", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"==(.+?)==", r"\1", text)

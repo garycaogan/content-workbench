@@ -1,15 +1,18 @@
 """Long-form drafts: pictures, covers, the 公众号 draft box and X Article drafts."""
 
 import io
+import time
 
+import httpx
+import pytest
 from PIL import Image
 
-from content_workbench import publish
+from content_workbench import publish, zsxq
 from content_workbench.app import wechat_crops
 from content_workbench.config import SecretStore
 from content_workbench.xarticle import content_state
 
-from test_app import ORIGIN, client, login
+from test_app import ORIGIN, client, login, save
 
 H = {"Origin": ORIGIN}
 
@@ -31,6 +34,17 @@ def upload(c, did, *blobs):
     return [im["id"] for im in r.json()]
 
 
+def wait_for(c, pid, timeout=10):
+    """A background push, once it has landed."""
+    end = time.time() + timeout
+    while time.time() < end:
+        p = c.get(f"/api/publications/{pid}").json()
+        if p["state"] != "pending":
+            return p
+        time.sleep(0.05)
+    raise AssertionError("push did not finish")
+
+
 def test_images_upload_serve_cover_and_delete():
     c = client()
     login(c)
@@ -40,15 +54,15 @@ def test_images_upload_serve_cover_and_delete():
     assert r.status_code == 200 and r.headers["content-type"] == "image/png" and "immutable" in r.headers["cache-control"]
     assert c.post(f"/api/drafts/{did}/images", files=[("files", ("x.png", b"not an image", "image/png"))], headers=H).status_code == 400
 
-    c.put(f"/api/drafts/{did}", json={"body": f"正文\n\n![图](/api/images/{a})", "cover_wechat": b, "cover_x": b,
+    save(c, did, {"body": f"正文\n\n![图](/api/images/{a})", "cover_wechat": b, "cover_x": b,
                                       "cover_crop": {"square_x": 0.5}, "summary": "摘要", "source_url": "https://github.com/x/y"}, headers=H)
     d = c.get(f"/api/drafts/{did}").json()
     assert (d["cover_wechat"], d["cover_x"], d["cover_crop"], d["summary"]) == (b, b, {"square_x": 0.5}, "摘要")
     assert len(d["images"]) == 2 and "file" not in d["images"][0]
-    assert c.put(f"/api/drafts/{did}", json={"source_url": "github.com"}, headers=H).status_code == 400
+    assert save(c, did, {"source_url": "github.com"}, headers=H).status_code == 400
 
     other = new_longform(c)
-    assert c.put(f"/api/drafts/{other}", json={"cover_wechat": a}, headers=H).status_code == 400
+    assert save(c, other, {"cover_wechat": a}, headers=H).status_code == 400
     assert c.delete(f"/api/images/{a}", headers=H).status_code == 400  # still in the body
     assert c.delete(f"/api/images/{b}", headers=H).status_code == 200
     assert c.get(f"/api/drafts/{did}").json()["cover_wechat"] is None
@@ -65,7 +79,7 @@ def test_push_to_wechat_uploads_pictures_once(monkeypatch):
     login(c)
     did = new_longform(c)
     pic, cover = upload(c, did, png(), png(470, 200))
-    c.put(f"/api/drafts/{did}", json={"body": f"## 一、开头\n\n第一段\n\n![](/api/images/{pic})\n\n再来一次 ![](/api/images/{pic})",
+    save(c, did, {"body": f"## 一、开头\n\n第一段\n\n![](/api/images/{pic})\n\n再来一次 ![](/api/images/{pic})",
                                       "cover_wechat": cover, "source_url": "https://github.com/x/y"}, headers=H)
     calls = {"inline": 0, "material": 0}
 
@@ -125,12 +139,38 @@ def test_x_article_content_state():
     assert last["inline_style_ranges"] == [{"offset": 5, "length": 1, "style": "bold"}]  # emoji is two UTF-16 units
 
 
+def test_x_article_has_two_heading_levels_and_links_stop_at_brackets():
+    state = content_state("### 三级\n\n#### 四级\n\n*【官方说明传送门https://a.com/b?x=1#c】*", lambda src: "M")
+    assert [b["type"] for b in state["blocks"]] == ["header-two", "header-two", "unstyled"]  # header-three gets a 503
+    assert [e["value"]["data"]["url"] for e in state["entities"]] == ["https://a.com/b?x=1#c"]
+
+
+def test_x_article_over_25_pictures_is_refused_before_upload(monkeypatch):
+    c = client()
+    login(c)
+    did = new_longform(c, "\n\n".join(f"第 {n} 段\n\n![](/api/images/{n})" for n in range(26)))
+    monkeypatch.setattr(publish, "x_upload_image", lambda *a: pytest.fail("nothing should be uploaded"))
+    r = c.post(f"/api/drafts/{did}/publish", json={"confirm": True, "target": "x_article"}, headers=H)
+    assert r.status_code == 400 and "最多放 25" in r.json()["detail"] and "26" in r.json()["detail"]
+
+
+def test_x_article_daily_limit_says_when(monkeypatch):
+    monkeypatch.setattr(publish, "_x_access_token", lambda store: "t")
+    reset = int(time.time()) + 3600
+    monkeypatch.setattr(publish.httpx, "post", lambda *a, **kw: httpx.Response(429, json={"title": "Too Many Requests"}, headers={
+        "x-user-limit-24hour-limit": "10", "x-user-limit-24hour-remaining": "0", "x-user-limit-24hour-reset": str(reset)}))
+    with pytest.raises(publish.PublishError) as err:
+        publish.x_article_draft(SecretStore(), "标题", {"blocks": [], "entities": []}, None)
+    assert "24 小时最多建 10 次" in str(err.value) and time.strftime("%H:%M", time.localtime(reset)) in str(err.value)
+    assert not err.value.uncertain
+
+
 def test_push_to_x_article(monkeypatch):
     c = client()
     login(c)
     did = new_longform(c)
     pic, cover_w, cover_x = upload(c, did, png(), png(470, 200), png(500, 200))
-    c.put(f"/api/drafts/{did}", json={"body": f"第一段\n\n![](/api/images/{pic})", "cover_wechat": cover_w, "cover_x": cover_x}, headers=H)
+    save(c, did, {"body": f"第一段\n\n![](/api/images/{pic})", "cover_wechat": cover_w, "cover_x": cover_x}, headers=H)
     uploaded = []
     monkeypatch.setattr(publish, "x_upload_image", lambda store, data, mime, name: (uploaded.append(name) or f"m{len(uploaded)}", 9e12))
     got = {}
@@ -140,6 +180,51 @@ def test_push_to_x_article(monkeypatch):
     assert got["cover"] == "m2" and got["title"] == "长文" and len(uploaded) == 2
     pub = c.get(f"/api/drafts/{did}").json()["publications"][0]
     assert (pub["platform"], pub["state"], pub["remote_id"]) == ("x_article", "sent", "42")
+
+
+def test_push_to_every_platform_in_one_go(monkeypatch):
+    c = client(zsxq_group_id="123456789", zsxq_group_name="示例星球")
+    login(c)
+    did = new_longform(c, "第一段\n\n第二段")
+    SecretStore().set("wx_default_cover", "COVER")
+    SecretStore().set("zsxq_token", "tok")
+    went = []
+    monkeypatch.setattr(publish, "wx_draft", lambda store, title, md, author, cover, **kw: went.append("wechat") or {"media_id": "W1"})
+
+    def x_refuses(store, title, state, cover):
+        went.append("x_article")
+        raise publish.PublishError("X 长文要账号开通 Premium")
+    monkeypatch.setattr(publish, "x_article_draft", x_refuses)
+    monkeypatch.setattr(zsxq, "call", lambda store, method, path, body=None: went.append("zsxq") or {"article_id": "Z1"})
+
+    r = c.post(f"/api/drafts/{did}/publish-all", json={"confirm": True, "targets": ["zsxq", "x_article", "wechat"]}, headers=H)
+    assert r.status_code == 200, r.text
+    pubs = r.json()["publications"]
+    assert [p["target"] for p in pubs] == ["wechat", "x_article", "zsxq"]  # platform order, whatever order they were picked in
+    done = {p["target"]: wait_for(c, p["publication_id"]) for p in pubs}
+    assert went == ["wechat", "x_article", "zsxq"]
+    assert (done["wechat"]["state"], done["wechat"]["remote_id"]) == ("sent", "W1")
+    assert done["x_article"]["state"] == "failed" and "Premium" in done["x_article"]["detail"]
+    assert (done["zsxq"]["state"], done["zsxq"]["remote_id"]) == ("sent", "Z1")  # X failing didn't stop 星球
+
+    # the failed one alone, again; a 星球 save cut off after its request went out is uncertain, not failed
+    monkeypatch.setattr(publish, "x_article_draft", lambda store, title, state, cover: {"article_id": "X1"})
+
+    def cut_off(store, method, path, body=None):
+        raise ConnectionResetError("连接断了")
+    monkeypatch.setattr(zsxq, "call", cut_off)
+    r = c.post(f"/api/drafts/{did}/publish-all", json={"confirm": True, "targets": ["x_article", "zsxq"]}, headers=H)
+    again = {p["target"]: wait_for(c, p["publication_id"]) for p in r.json()["publications"]}
+    assert (again["x_article"]["state"], again["x_article"]["remote_id"]) == ("sent", "X1")
+    assert again["zsxq"]["state"] == "unknown"
+    rows = c.get(f"/api/drafts/{did}").json()["publications"]
+    assert [(p["platform"], p["state"]) for p in rows] == [("zsxq", "unknown"), ("x_article", "sent"), ("zsxq", "sent"),
+                                                           ("x_article", "failed"), ("wechat", "sent")]
+
+    for bad in ({"targets": ["wechat"]}, {"confirm": True, "targets": []}, {"confirm": True, "targets": ["x"]},
+                {"confirm": True, "targets": "wechat"}):
+        assert c.post(f"/api/drafts/{did}/publish-all", json=bad, headers=H).status_code == 400
+    assert len(c.get(f"/api/drafts/{did}").json()["publications"]) == 5  # refused requests start nothing
 
 
 def test_x_image_upload_needs_media_scope():
@@ -169,7 +254,7 @@ def test_push_to_zsxq_uploads_once_and_updates_the_same_draft(monkeypatch):
     login(c)
     did = new_longform(c)
     pic, = upload(c, did, png())
-    c.put(f"/api/drafts/{did}", json={"body": f"## 一、开头\n\n**重点** ==高亮==\n\n![](/api/images/{pic})"}, headers=H)
+    save(c, did, {"body": f"## 一、开头\n\n**重点** ==高亮==\n\n![](/api/images/{pic})"}, headers=H)
     SecretStore().set("zsxq_token", "tok")
     uploads, saved = [], []
     monkeypatch.setattr(zsxq, "upload_image", lambda store, data, mime, name: (uploads.append(name) or ("img9", "https://images.zsxq.com/x.jpg")))
@@ -187,6 +272,59 @@ def test_push_to_zsxq_uploads_once_and_updates_the_same_draft(monkeypatch):
     assert "![](https://images.zsxq.com/x.jpg)" in req["original_content"]
     assert '<img src="https://images.zsxq.com/x.jpg"' in req["content"] and "<mark>" not in req["content"]
     assert "<h2>一、开头</h2>" in req["content"]
+
+
+def test_zsxq_push_keeps_finished_uploads_when_one_picture_fails(monkeypatch):
+    from content_workbench import images, zsxq, publish
+    c = client(zsxq_group_id="123456789")
+    login(c)
+    did = new_longform(c)
+    pics = upload(c, did, png(color=(1, 2, 3)), png(color=(4, 5, 6)), png(color=(7, 8, 9)))
+    save(c, did, {"body": "\n\n".join(f"![](/api/images/{p})" for p in pics)}, headers=H)
+    SecretStore().set("zsxq_token", "tok")
+    calls, fail = [], {"p1.png"}
+
+    def fake_upload(store, data, mime, name):
+        calls.append(name)
+        if name in fail:
+            raise publish.PublishError("图片传到知识星球失败（试了 3 次）：502 <html>")
+        return f"id-{name}", f"https://article-images.zsxq.com/{name}"
+    monkeypatch.setattr(zsxq, "upload_image", fake_upload)
+    monkeypatch.setattr(images, "encoded", lambda image, max_bytes: (b"x", "image/png", image["name"]))
+    monkeypatch.setattr(zsxq, "call", lambda store, method, path, body=None: {"article_id": "art1"})
+    r = c.post(f"/api/drafts/{did}/publish", json={"confirm": True, "target": "zsxq"}, headers=H)
+    assert r.status_code == 400 and "试了 3 次" in r.json()["detail"]
+    assert sorted(calls) == ["p0.png", "p1.png", "p2.png"]
+    fail.clear()
+    calls.clear()
+    r = c.post(f"/api/drafts/{did}/publish", json={"confirm": True, "target": "zsxq"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert calls == ["p1.png"]  # the two that went through the first time are not sent again
+
+
+def test_zsxq_upload_retries_when_the_image_host_answers_garbage(monkeypatch):
+    from content_workbench import zsxq, publish
+    store = SecretStore()
+    monkeypatch.setattr(zsxq, "call", lambda st, m, path, body=None: {"upload_token": "t"})
+    monkeypatch.setattr(zsxq.time, "sleep", lambda s: None)
+
+    class Resp:
+        def __init__(self, body, status=200): self._b, self.status_code, self.text = body, status, str(body)
+        def json(self):
+            if isinstance(self._b, str):
+                raise ValueError("Expecting value")
+            return self._b
+    good = Resp({"succeeded": True, "link": "https://article-images.zsxq.com/k", "resp_data": {"image_id": 7}})
+    answers = [Resp("", 200), Resp("<html>bad gateway</html>", 502), good]
+    monkeypatch.setattr(zsxq.httpx, "post", lambda *a, **k: answers.pop(0))
+    assert zsxq.upload_image(store, b"x", "image/png", "a.png") == ("7", "https://article-images.zsxq.com/k")
+    monkeypatch.setattr(zsxq.httpx, "post", lambda *a, **k: Resp("<html>bad gateway</html>", 502))
+    try:
+        zsxq.upload_image(store, b"x", "image/png", "a.png")
+    except publish.PublishError as exc:
+        assert "试了 3 次" in str(exc) and "502" in str(exc)
+    else:
+        raise AssertionError("three bad answers must fail loudly")
 
 
 def test_zsxq_upload_asks_for_article_usage_and_needs_a_link(monkeypatch):

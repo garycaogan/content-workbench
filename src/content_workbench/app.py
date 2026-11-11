@@ -2,28 +2,38 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import auth, comments, db, images, jobs, learning, llm, prompts, publish, sources, video, xarticle, xhs, zsxq
+from . import auth, clips, comments, db, images, jobs, learning, llm, prompts, publish, sources, video, xarticle, xhs, zsxq
 from .config import SecretStore, Settings, data_dir, ensure_setup_code
-from .textutil import normalize_emphasis, thread_report, wechat_html
+from .textutil import X_LIMIT, normalize_emphasis, thread_report, wechat_html, x_weighted_length
 
 WX_INLINE_MAX = 1024 * 1024 - 4096      # media/uploadimg: jpg/png under 1MB
 WX_COVER_MAX = 9 * 1024 * 1024          # permanent image material: 10MB
 X_IMAGE_MAX = 5 * 1024 * 1024 - 4096    # X pictures: 5MB
-DRAFT_FIELDS = ("title", "body", "notes", "summary", "source_url")
+X_VIDEO_TTL = 23 * 3600                 # an uploaded X video unused for 24 h is gone
+DRAFT_FIELDS = ("title", "body", "notes", "summary", "source_url", "context")
+FIELD_NAMES = {"title": "标题", "body": "正文", "notes": "备注", "summary": "摘要", "source_url": "阅读原文", "context": "背景资料"}
 
 # CW_WEB_DIST lets a test instance serve a build without touching the live web/dist
 WEB_DIST = Path(os.environ.get("CW_WEB_DIST") or Path(__file__).resolve().parents[2] / "web" / "dist")
 SECRET_KEYS = ("x_client_id", "x_client_secret", "wx_appid", "wx_secret")
+
+
+def field_revs(draft: dict) -> dict:
+    """A fingerprint of each text field, so a save can say which version it was edited from."""
+    return {k: hashlib.sha1((draft.get(k) or "").encode()).hexdigest()[:16] for k in DRAFT_FIELDS}
 
 
 def create_app(settings: Settings | None = None, start_jobs: bool = True) -> FastAPI:
@@ -323,36 +333,63 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             raise HTTPException(404)
         found["publications"] = db.rows("SELECT * FROM publications WHERE draft_id=? ORDER BY id DESC", (did,))
         found["images"] = images.for_draft(did)
+        found["clips"] = clips.for_draft(did)
         found["cover_crop"] = db.loads(found.get("cover_crop"), {})
         found["xhs"] = xhs.load(found)
         found["video"] = video.load(found)
+        found["rev"] = field_revs(found)
         return found
+
+    @app.get("/api/drafts/{did}/rev")
+    def draft_rev(did: int):
+        """Cheap enough for an open editor to ask every few seconds whether the draft changed elsewhere."""
+        found = db.row("SELECT * FROM drafts WHERE id=?", (did,))
+        if not found:
+            raise HTTPException(404)
+        return {"rev": field_revs(found), "status": found["status"], "updated_at": found["updated_at"]}
 
     @app.put("/api/drafts/{did}")
     def save_draft(did: int, body: dict = Body(...)):
-        current = db.row("SELECT * FROM drafts WHERE id=?", (did,))
-        if not current:
-            raise HTTPException(404)
-        values = {k: str(body[k]) if body.get(k) is not None else (current[k] or "") for k in DRAFT_FIELDS}
-        if current["platform"] != "x":
-            values["body"] = normalize_emphasis(values["body"])
-        values["body"] = comments.strip_lifted(did, values["body"])
-        title, text = values["title"], values["body"]
-        source_url = values["source_url"].strip()
-        if source_url and not re.match(r"^https?://\S+$", source_url):
-            raise HTTPException(400, "阅读原文要填一个完整的网址")
-        values["source_url"] = source_url
-        covers = {}
-        for key in ("cover_wechat", "cover_x"):
-            if key in body:
-                cid = body[key]
-                if cid is not None and not db.row("SELECT 1 x FROM images WHERE id=? AND draft_id=?", (int(cid), did)):
-                    raise HTTPException(400, "这张图不属于这篇稿子")
-                covers[key] = int(cid) if cid is not None else None
-        crop = body.get("cover_crop", None)
-        with db.tx() as conn:
-            conn.execute("UPDATE drafts SET title=?, body=?, notes=?, summary=?, source_url=?, updated_at=? WHERE id=?",
-                         (title, text, values["notes"], values["summary"], source_url, db.now(), did))
+        # The editor sends only the fields it changed, each with the fingerprint it was edited from (base).
+        # A field changed elsewhere since then (an AI revision, another tab) is refused, never overwritten.
+        sent = [k for k in DRAFT_FIELDS if body.get(k) is not None]
+        base = body.get("base")
+        if sent and not isinstance(base, dict):
+            raise HTTPException(428, "这个页面是工作台更新之前打开的，保存不了：先把没保存的字复制出来，再刷新页面。")
+        with db.tx() as conn:  # read, check and write under one lock, so no other save lands in between
+            current = conn.execute("SELECT * FROM drafts WHERE id=?", (did,)).fetchone()
+            if not current:
+                raise HTTPException(404)
+            current = dict(current)
+            stored = {k: current[k] or "" for k in DRAFT_FIELDS}
+            values = {k: str(body[k]) if k in sent else stored[k] for k in DRAFT_FIELDS}
+            if "body" in sent:
+                if current["platform"] != "x":
+                    values["body"] = normalize_emphasis(values["body"])
+                values["body"] = comments.strip_lifted(did, values["body"])
+            title, text = values["title"], values["body"]
+            source_url = values["source_url"].strip()
+            if source_url and not re.match(r"^https?://\S+$", source_url):
+                raise HTTPException(400, "阅读原文要填一个完整的网址")
+            values["source_url"] = source_url
+            revs = field_revs(stored)
+            stale = [k for k in sent if base.get(k) != revs[k] and values[k] != stored[k]]
+            if stale:
+                raise HTTPException(409, f"这篇稿子的{'、'.join(FIELD_NAMES[k] for k in stale)}在你打开之后被别处改过"
+                                         "（AI 改稿或别的页面），这页上的是旧的。为了不盖掉新版本，这次没有保存。")
+            covers = {}
+            for key in ("cover_wechat", "cover_x"):
+                if key in body:
+                    cid = body[key]
+                    if cid is not None and not db.row("SELECT 1 x FROM images WHERE id=? AND draft_id=?", (int(cid), did)):
+                        raise HTTPException(400, "这张图不属于这篇稿子")
+                    covers[key] = int(cid) if cid is not None else None
+            crop = body.get("cover_crop", None)
+            # 背景资料 isn't archived: editing only that keeps updated_at, so Feishu isn't rewritten for nothing
+            archived = covers or isinstance(crop, dict) or any(values[k] != stored[k] for k in DRAFT_FIELDS if k != "context")
+            stamp = db.now() if archived else current["updated_at"]
+            conn.execute("UPDATE drafts SET title=?, body=?, notes=?, summary=?, source_url=?, context=?, updated_at=? WHERE id=?",
+                         (title, text, values["notes"], values["summary"], source_url, values["context"], stamp, did))
             for key, cid in covers.items():
                 conn.execute(f"UPDATE drafts SET {key}=? WHERE id=?", (cid, did))
             if isinstance(crop, dict):
@@ -362,12 +399,14 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             if (not last or db.now() - last["created_at"] > 600) and text != (last["body"] if last else None):
                 conn.execute("INSERT INTO draft_versions(draft_id, title, body, created_at, origin) VALUES (?,?,?,?, 'edit')",
                              (did, title, text, db.now()))
-        return {"ok": True, "updated_at": db.now()}
+        return {"ok": True, "updated_at": stamp, "rev": field_revs(values)}
 
     @app.delete("/api/drafts/{did}")
     def delete_draft(did: int):
         for im in images.for_draft(did):
             images.delete(im["id"])
+        for c in clips.for_draft(did):
+            clips.delete(c["id"])
         with db.tx() as conn:
             conn.execute("DELETE FROM drafts WHERE id=?", (did,))
         return {"ok": True}
@@ -375,6 +414,19 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
     @app.get("/api/drafts/{did}/versions")
     def versions(did: int):
         return db.rows("SELECT id, title, body, created_at, origin FROM draft_versions WHERE draft_id=? ORDER BY id DESC", (did,))
+
+    @app.post("/api/drafts/{did}/versions")
+    def keep_version(did: int, body: dict = Body(...)):
+        """When the editor and a change made elsewhere clash, the side that gives way stays in the history:
+        unsaved = what the page had and couldn't save, replaced = what the author chose to overwrite."""
+        if body.get("origin") not in ("unsaved", "replaced"):
+            raise HTTPException(400, "只能存没保存上的版本或被覆盖的版本")
+        if not db.row("SELECT 1 x FROM drafts WHERE id=?", (did,)):
+            raise HTTPException(404)
+        with db.tx() as conn:
+            vid = conn.execute("INSERT INTO draft_versions(draft_id, title, body, created_at, origin) VALUES (?,?,?,?,?)",
+                               (did, str(body.get("title") or ""), str(body.get("body") or ""), db.now(), body["origin"])).lastrowid
+        return {"id": vid}
 
     # ------------------------------------------------------------ Feishu archive and cases
     @app.post("/api/drafts/{did}/feishu")
@@ -570,6 +622,80 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
         images.delete(iid)
         return {"ok": True}
 
+    # ------------------------------------------------------------ videos in the body (clips.py)
+    @app.post("/api/drafts/{did}/clips")
+    def new_clip(did: int, body: dict = Body(...)):
+        """Start an upload; the file then comes in pieces (see clip_data)."""
+        if not db.row("SELECT 1 x FROM drafts WHERE id=?", (did,)):
+            raise HTTPException(404)
+        try:
+            return clips.public(clips.create(did, str(body.get("name") or ""), int(body.get("size") or 0)))
+        except clips.ClipError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    def _clip(cid: int) -> dict:
+        found = clips.get(cid)
+        if not found:
+            raise HTTPException(404)
+        return found
+
+    @app.put("/api/clips/{cid}/data")
+    async def clip_data(cid: int, request: Request, offset: int = 0):
+        data = await request.body()
+        try:
+            return {"received": clips.append(_clip(cid), offset, data)}
+        except clips.ClipError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/api/clips/{cid}/finish")
+    def clip_finish(cid: int):
+        found = _clip(cid)
+        try:
+            clips.finish(found)
+        except clips.ClipError as exc:
+            raise HTTPException(400, str(exc)) from None
+        if found["state"] == "uploading":
+            jobs.enqueue("clip", {"clip_id": cid})
+        return clips.public(_clip(cid))
+
+    @app.get("/api/clips/{cid}/info")
+    def clip_info(cid: int):
+        return clips.public(_clip(cid))
+
+    @app.patch("/api/clips/{cid}")
+    def update_clip(cid: int, body: dict = Body(...)):
+        _clip(cid)
+        try:
+            clips.set_link(cid, str(body.get("link") or ""))
+        except clips.ClipError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return clips.public(_clip(cid))
+
+    @app.get("/api/clips/{cid}")
+    def clip_file(cid: int):
+        found = _clip(cid)
+        if found["state"] != "ready" or not clips.path_of(found).is_file():
+            raise HTTPException(404, "视频还没处理好")
+        return FileResponse(clips.path_of(found), media_type="video/mp4",
+                            headers={"Cache-Control": "private, max-age=86400, immutable"})
+
+    @app.get("/api/clips/{cid}/poster.jpg")
+    def clip_poster(cid: int):
+        found = _clip(cid)
+        if not clips.poster_of(found).is_file():
+            raise HTTPException(404)
+        return FileResponse(clips.poster_of(found), media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=86400, immutable"})
+
+    @app.delete("/api/clips/{cid}")
+    def delete_clip(cid: int):
+        found = _clip(cid)
+        draft = db.row("SELECT body FROM drafts WHERE id=?", (found["draft_id"],))
+        if draft and cid in clips.referenced(draft["body"]):
+            raise HTTPException(400, "正文里还在用这段视频，先从正文里删掉")
+        clips.delete(cid)
+        return {"ok": True}
+
     @app.post("/api/preview")
     def preview(body: dict = Body(...)):
         platform = body.get("platform")
@@ -578,7 +704,7 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
         if platform == "x":
             out["thread"] = thread_report(text)
         else:
-            out["html"] = wechat_html(text)
+            out["html"] = wechat_html(clips.as_frames(text))
         return out
 
     # ------------------------------------------------------------ publish
@@ -591,25 +717,27 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             raise HTTPException(404)
         # 长文 (platform wechat) goes to the 公众号 draft box or to an X Article draft; X drafts are threads.
         target = body.get("target") or draft["platform"]
-        allowed = ("x",) if draft["platform"] == "x" else ("wechat", "x_article", "zsxq")
+        allowed = ("x",) if draft["platform"] == "x" else tuple(LONGFORM)
         if target not in allowed:
             raise HTTPException(400, "这篇稿子不能发到这个平台")
         learning.record_round(did, draft["body"], "publish")
+        if target == "x_article" and clips.referenced(draft["body"]):
+            if not draft["title"].strip():
+                raise HTTPException(400, "X 长文要有标题")
+            return _start_push(draft, [target])  # videos take minutes to upload: runs in the background
         try:
             if target == "x":
                 result = publish.x_publish(store, draft["body"])
                 remote = ",".join(result["ids"])
-            elif target == "x_article":
-                result = _push_x_article(draft)
-                remote = result.get("article_id")
-            elif target == "zsxq":
-                result = _push_zsxq(draft)
-                remote = result.get("article_id")
-            else:
+            elif target == "wechat":
                 result = _push_wechat(draft, body.get("cover_media_id"))
                 remote = result["media_id"]
+            else:
+                _, push, key = LONGFORM[target]
+                result = push(draft)
+                remote = result.get(key)
             state = "sent"
-        except (publish.PublishError, images.ImageError) as exc:
+        except (publish.PublishError, images.ImageError, clips.ClipError) as exc:
             uncertain = getattr(exc, "uncertain", False)
             state = "unknown" if uncertain else "failed"
             with db.tx() as conn:
@@ -623,10 +751,36 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
                 conn.execute("UPDATE drafts SET status='published', updated_at=? WHERE id=?", (db.now(), did))
         return {"ok": True, **result}
 
+    @app.post("/api/drafts/{did}/publish-all")
+    def publish_all(did: int, body: dict = Body(...)):
+        """一键推送: the chosen long-form platforms one after another in the background, each with its own
+        publications row, so one failing doesn't stop the rest and a failed one can be pushed again alone."""
+        if body.get("confirm") is not True:
+            raise HTTPException(400, "需要确认")
+        draft = db.row("SELECT * FROM drafts WHERE id=?", (did,))
+        if not draft:
+            raise HTTPException(404)
+        chosen = body.get("targets") or []
+        if draft["platform"] == "x" or not isinstance(chosen, list) or any(t not in LONGFORM for t in chosen):
+            raise HTTPException(400, "这篇稿子不能发到这个平台")
+        if not chosen:
+            raise HTTPException(400, "至少选一个平台")
+        learning.record_round(did, draft["body"], "publish")
+        return _start_push(draft, [t for t in LONGFORM if t in chosen])
+
     def _body_image(src_id: int, draft_id: int) -> dict:
         found = images.get(src_id)
         if not found or found["draft_id"] != draft_id:
             raise images.ImageError(f"正文里的第 {src_id} 号图片找不到了，重新插一次")
+        return found
+
+    def _body_clip(cid: int, draft_id: int) -> dict:
+        found = clips.get(cid)
+        if not found or found["draft_id"] != draft_id:
+            raise publish.PublishError(f"正文里的第 {cid} 号视频找不到了，重新插一次")
+        if found["state"] != "ready":
+            why = found["error"] or ("还在上传" if found["state"] == "uploading" else "还在处理，等一下")
+            raise publish.PublishError(f"正文里的视频「{found['name']}」{why}")
         return found
 
     def _wx_cover(image: dict) -> str:
@@ -638,8 +792,39 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
         images.remember(image["id"], "wx_cover", media_id, None)
         return media_id
 
-    def _push_wechat(draft: dict, override_cover: str | None) -> dict:
-        html = wechat_html(draft["body"])
+    def _stage(pid: int | None, stage: str, posting: bool = False) -> None:
+        """Progress of a background push; posting marks the request after which a cut-off push may have gone through."""
+        if not pid:
+            return
+        pushing[pid] = {"stage": stage, "pct": 0}
+        if posting:
+            with db.tx() as conn:
+                conn.execute("UPDATE publications SET detail=? WHERE id=?", (db.dumps({"stage": "posting"}), pid))
+
+    def _push_wechat(draft: dict, override_cover: str | None = None, pid: int | None = None) -> dict:
+        # A video can't go into a 公众号 article through the API: draft/add keeps the editor's own video
+        # block, but a video uploaded through the API is only for menus and auto-replies ("API上传完成"),
+        # the editor won't pick it, and an embedded one never leaves 审核中 (checked in the backend
+        # 2026-10-27). So each video goes in as its still frame plus a highlighted line saying which file to
+        # upload there by hand (视频 → 本地上传), the way the editor wants it.
+        refs = clips.referenced(draft["body"])
+        _stage(pid, "传图片到公众号")
+
+        def note(cid: int) -> str:
+            clip = clips.get(cid) or {}
+            return (f"==▶ 这里放视频「{clip.get('name') or '视频'}」（{clips.minutes(clip.get('duration'))}）：点上面这张图删掉，"
+                    f"在「视频 → 本地上传」里传这个文件（工作台正文里也能下载），审核通过后再发表；放好后删掉这一段==")
+        html = wechat_html(clips.frames_with_notes(draft["body"], note))
+        for cid in refs:
+            clip = _body_clip(cid, draft["id"])
+            cached = clips.remote(cid, "wx_inline")
+            if cached:
+                url = cached["url"]
+            else:
+                url = publish.wx_upload_inline(store, clips.poster_bytes(clip, max_bytes=WX_INLINE_MAX, max_side=2000),
+                                               "image/jpeg", f"clip-{cid}.jpg")
+                clips.remember(cid, "wx_inline", None, url)
+            html = html.replace(f'src="{clips.frame_ref(cid)}"', f'src="{re.sub(r"^http://", "https://", url)}"')
         for iid in images.referenced(draft["body"]):
             image = _body_image(iid, draft["id"])
             cached = images.remote(iid, "wx_inline")
@@ -663,9 +848,11 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
                                              db.loads(draft.get("cover_crop"), {}).get("square_x", 0.0))
         else:
             cover = override_cover or store.get("wx_default_cover")
-        return publish.wx_draft(store, draft["title"], draft["body"], settings.author, cover, html=html,
-                                summary=draft.get("summary") or "", source_url=draft.get("source_url") or "",
-                                crop_235=crop_235, crop_11=crop_11)
+        _stage(pid, "建公众号草稿", posting=True)
+        result = publish.wx_draft(store, draft["title"], draft["body"], settings.author, cover, html=html,
+                                  summary=draft.get("summary") or "", source_url=draft.get("source_url") or "",
+                                  crop_235=crop_235, crop_11=crop_11)
+        return {**result, "video_frames": len(refs)} if refs else result
 
     def _x_media(image: dict) -> str:
         cached = images.remote(image["id"], "x_media")
@@ -676,20 +863,61 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
         images.remember(image["id"], "x_media", media_id, None, expires)
         return media_id
 
-    def _push_zsxq(draft: dict) -> dict:
-        body = draft["body"]
-        ids: list[str] = []
-        for iid in images.referenced(body):
-            image = _body_image(iid, draft["id"])
-            cached = images.remote(iid, "zsxq")
+    def _push_zsxq(draft: dict, pid: int | None = None) -> dict:
+        _stage(pid, "传图片到星球")
+
+        # 星球 articles have no video at all: each one goes in as its still frame, with a line to watch it if it has a link
+        def watch(cid: int) -> str:
+            clip = clips.get(cid) or {}
+            return f"▶ [看视频（{clips.minutes(clip.get('duration'))}）]({clip['link']})" if clip.get("link") else ""
+        body = clips.frames_with_notes(draft["body"], watch)
+        frames: list[tuple[int, str, str]] = []
+        for cid in clips.referenced(draft["body"]):
+            clip = _body_clip(cid, draft["id"])
+            cached = clips.remote(cid, "zsxq")
             if cached and cached["url"]:
                 image_id, link = cached["remote_id"], cached["url"]
             else:
-                data, mime, name = images.encoded(image, max_bytes=9 * 1024 * 1024)
-                image_id, link = zsxq.upload_image(store, data, mime, name)
-                images.remember(iid, "zsxq", image_id, link)
+                image_id, link = zsxq.upload_image(store, clips.poster_bytes(clip, max_bytes=9 * 1024 * 1024), "image/jpeg",
+                                                   f"clip-{cid}.jpg")
+                clips.remember(cid, "zsxq", image_id, link)
+            frames.append((cid, image_id, link))
+        refs = images.referenced(body)
+        found: dict[int, tuple[str, str]] = {}
+        todo = []
+        for iid in refs:
+            image = _body_image(iid, draft["id"])
+            cached = images.remote(iid, "zsxq")
+            if cached and cached["url"]:
+                found[iid] = (cached["remote_id"], cached["url"])
+            else:
+                todo.append((iid, image))
+        # One by one, a picture-heavy article ran past the gateway's ~100 s limit, so upload a few at a time.
+        if todo:
+            def send(item):
+                data, mime, name = images.encoded(item[1], max_bytes=9 * 1024 * 1024)
+                return item[0], zsxq.upload_image(store, data, mime, name)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(send, item) for item in todo]
+                failure = None
+                for future in futures:
+                    try:
+                        iid, (image_id, link) = future.result()
+                    except (publish.PublishError, images.ImageError) as exc:
+                        failure = failure or exc
+                        continue
+                    images.remember(iid, "zsxq", image_id, link)  # kept even if another picture fails
+                    found[iid] = (image_id, link)
+            if failure:
+                raise failure
+        ids: list[str] = []
+        for iid in refs:
+            image_id, link = found[iid]
             ids.append(image_id)
             body = body.replace(f"/api/images/{iid})", f"{link})")
+        for cid, image_id, link in frames:
+            ids.append(image_id)
+            body = body.replace(f"{clips.frame_ref(cid)})", f"{link})")
         if images.REF_RE.search(body) or re.search(r"!\[[^\]]*\]\((?!https?://)", body):
             raise publish.PublishError("正文里有图片没传上去，先检查一下图片")
         # pushing again updates the same draft instead of adding another
@@ -697,26 +925,116 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
                          AND remote_id IS NOT NULL AND remote_id != '' ORDER BY id DESC LIMIT 1""", (draft["id"],))
         if not settings.zsxq_group_id:
             raise publish.PublishError("先在设置里填要存草稿的星球编号")
-        return zsxq.save_draft(store, settings.zsxq_group_id, draft["title"], body, ids,
-                               article_id=(last or {}).get("remote_id") or "")
+        _stage(pid, "存星球草稿", posting=True)
+        result = zsxq.save_draft(store, settings.zsxq_group_id, draft["title"], body, ids,
+                                 article_id=(last or {}).get("remote_id") or "")
+        return {**result, "video_frames": len(frames)} if frames else result
 
-    def _push_x_article(draft: dict) -> dict:
+    # A push that may run past the gateway's ~100 s goes to the background: an X article with videos
+    # (uploading and X's processing take minutes) and 一键推送 (several platforms in a row). Each platform
+    # gets a pending publications row, progress lives here, and a restart closes it (video.recover_sends).
+    pushing: dict[int, dict] = {}
+
+    def _start_push(draft: dict, targets: list[str]) -> dict:
+        try:
+            for cid in clips.referenced(draft["body"]):
+                _body_clip(cid, draft["id"])
+        except publish.PublishError as exc:
+            raise HTTPException(400, str(exc)) from None
+        with db.tx() as conn:
+            for target in targets:
+                if conn.execute("SELECT 1 FROM publications WHERE draft_id=? AND platform=? AND state='pending'",
+                                (draft["id"], target)).fetchone():
+                    raise HTTPException(400, f"{LONGFORM[target][0]}上一次还没推完，等它结束")
+            pids = [conn.execute("INSERT INTO publications(draft_id, platform, state, detail, created_at) VALUES (?,?,?,?,?)",
+                                 (draft["id"], target, "pending", db.dumps({"stage": "queued"}), db.now())).lastrowid
+                    for target in targets]
+        for pid in pids:
+            pushing[pid] = {"stage": "排队中", "pct": 0}
+        runs = list(zip(targets, pids))
+
+        def run_all() -> None:  # one after another; each writes its own row whatever the others did
+            for target, pid in runs:
+                _run_push(dict(draft), target, pid)
+        threading.Thread(target=run_all, daemon=True, name=f"cw-push-{pids[0]}").start()
+        return {"ok": True, "pending": True, "publication_id": pids[0],
+                "publications": [{"target": t, "publication_id": p} for t, p in runs]}
+
+    def _run_push(draft: dict, target: str, pid: int) -> None:
+        def write(state: str, remote: str | None, detail: dict) -> None:
+            with db.tx() as conn:
+                conn.execute("UPDATE publications SET state=?, remote_id=?, detail=? WHERE id=?",
+                             (state, remote, db.dumps(detail), pid))
+        _, push, key = LONGFORM[target]
+        try:
+            result = push(draft, pid=pid)
+        except (publish.PublishError, images.ImageError, clips.ClipError) as exc:
+            write("unknown" if getattr(exc, "uncertain", False) else "failed", None,
+                  {"error": str(exc), **getattr(exc, "detail", {})})
+        except Exception as exc:  # anything unexpected after the draft request may still have gone through
+            posting = (db.loads((db.row("SELECT detail FROM publications WHERE id=?", (pid,)) or {}).get("detail"), {}) or {}).get("stage") == "posting"
+            write("unknown" if posting else "failed", None, {"error": f"出错了：{exc}"})
+        else:
+            write("sent", result.get(key), result)
+        finally:
+            pushing.pop(pid, None)
+
+    def _x_clip(clip: dict, progress=None) -> str:
+        cached = clips.remote(clip["id"], "x_media")
+        if cached:
+            return cached["remote_id"]
+        media_id = publish.x_upload_video(store, clips.path_of(clip), progress)
+        clips.remember(clip["id"], "x_media", media_id, None, db.now() + X_VIDEO_TTL)
+        return media_id
+
+    def _push_x_article(draft: dict, pid: int | None = None) -> dict:
         title = draft["title"].strip()
         if not title:
             raise publish.PublishError("X 长文要有标题")
+        media = xarticle.media_count(draft["body"])
+        if media > xarticle.MAX_MEDIA:
+            raise publish.PublishError(f"X 长文最多放 {xarticle.MAX_MEDIA} 张图片和视频，这篇有 {media} 个："
+                                       "先把相邻的图拼成一张，或者给 X 版删掉一些")
+        refs = clips.referenced(draft["body"])
+        for cid in refs:  # checked before anything is uploaded
+            clip = _body_clip(cid, draft["id"])
+            if (clip["duration"] or 0) > publish.X_VIDEO_MAX_SECONDS:
+                raise publish.PublishError(
+                    f"X 接口只收 {clips.minutes(publish.X_VIDEO_MAX_SECONDS)} 以内的视频，「{clip['name']}」有 "
+                    f"{clips.minutes(clip['duration'])}：剪短再推，或者推完到 X 网页编辑器里换成这段视频")
+        for n, cid in enumerate(refs, 1):
+            def progress(share: float, n: int = n) -> None:
+                if pid:
+                    pushing[pid] = ({"stage": f"X 在处理第 {n}/{len(refs)} 段视频", "pct": 100} if share >= 1
+                                    else {"stage": f"第 {n}/{len(refs)} 段视频传到 X", "pct": round(share * 100)})
+            _x_clip(_body_clip(cid, draft["id"]), progress)
 
-        def resolve(src: str) -> str:
-            m = images.REF_RE.fullmatch(src.strip())
+        def resolve(src: str) -> str | tuple[str, str]:
+            src = src.strip()
+            if m := clips.REF_RE.fullmatch(src):
+                return _x_clip(_body_clip(int(m.group(1)), draft["id"])), "tweet_video"
+            m = images.REF_RE.fullmatch(src)
             if not m:
                 raise publish.PublishError(f"正文里有不是从工作台插入的图片（{src[:60]}），先换成上传的图片")
             return _x_media(_body_image(int(m.group(1)), draft["id"]))
 
+        _stage(pid, "传图片到 X")
         state = xarticle.content_state(draft["body"], resolve)
         if not state["blocks"]:
             raise publish.PublishError("正文是空的")
         cover_id = draft.get("cover_x") or draft.get("cover_wechat")
         cover = _x_media(images.get(cover_id)) if cover_id and images.get(cover_id) else None
-        return publish.x_article_draft(store, title, state, cover)
+        _stage(pid, "建 X 长文草稿", posting=True)
+        result = publish.x_article_draft(store, title, state, cover)
+        return {**result, "videos": len(refs)} if refs else result
+
+    # The long-form platforms, in the order 一键推送 goes through them: name, push(draft, pid=None) and the field
+    # of its result that names the draft over there. All three only save a draft; nothing is published.
+    LONGFORM = {
+        "wechat": ("公众号", lambda draft, pid=None: _push_wechat(draft, None, pid), "media_id"),
+        "x_article": ("X 长文", _push_x_article, "article_id"),
+        "zsxq": ("星球", _push_zsxq, "article_id"),
+    }
 
     # ------------------------------------------------------------ 小红书
     @app.post("/api/drafts/{did}/xhs/generate")
@@ -808,18 +1126,57 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
     def video_update(did: int, body: dict = Body(...)):
         state = video.load(_video_draft(did))
         if isinstance(body.get("scenes"), list):
-            allowed = {im["id"] for im in images.for_draft(did)}
-            state["scenes"] = [video.normalize(s, allowed, keep_type=True) for s in body["scenes"] if isinstance(s, dict)][:16]
+            allowed, allowed_clips = {im["id"] for im in images.for_draft(did)}, video.draft_clips(did)
+            state["scenes"] = [video.normalize(s, allowed, keep_type=True, allowed_clips=allowed_clips)
+                               for s in body["scenes"] if isinstance(s, dict)][:16]
             state["edited_at"] = db.now()
         if body.get("voice") in {v["id"] for v in video.voices(settings)}:
             state["voice"] = body["voice"]
         if "bgm" in body:
             state["bgm"] = bool(body["bgm"])
+        if body.get("style") in video.vs.STYLES:
+            state["style"] = body["style"]
+        if isinstance(body.get("headline"), list):
+            state["headline"] = [str(x).strip()[:14] for x in body["headline"] if str(x).strip()][:2]
+        if isinstance(body.get("headline_key"), str):
+            state["headline_key"] = body["headline_key"].strip()[:10]
+        if isinstance(body.get("meta"), dict):
+            old = state.get("meta") or {}
+            state["meta"] = {**video.clean_meta(body["meta"], {im["id"] for im in images.for_draft(did)}, old),
+                             "generated_at": old.get("generated_at"), "edited_at": db.now()}
         video.save(did, state)
         return state
 
+    @app.post("/api/drafts/{did}/video/meta")
+    def video_meta(did: int):
+        """Write the title, intro and cover words again (the model reads the article and the script)."""
+        state = video.load(_video_draft(did))
+        if state.get("meta_status") == "generating":
+            return state
+        state.update(meta_status="generating", meta_error=None)
+        video.save(did, state)
+        jobs.enqueue("video_meta", {"draft_id": did})
+        return state
+
+    @app.get("/api/drafts/{did}/video/cover.jpg")
+    def video_cover(did: int, format: str = "vertical", download: int = 0):
+        draft = _video_draft(did)
+        fmt = format if format in video.FORMATS else "vertical"
+        try:
+            path = video.cover(settings, did, fmt)
+        except video.VideoError as exc:
+            raise HTTPException(404, str(exc)) from None
+        headers = {"Cache-Control": "private, no-cache"}
+        if not download:
+            return FileResponse(path, media_type="image/jpeg", headers=headers)
+        name = re.sub(r"[^\w\u4e00-\u9fff-]+", "", draft["title"] or "视频")[:24] or "video"
+        return FileResponse(path, media_type="image/jpeg", headers=headers,
+                            filename=f"{name}-封面{'' if fmt == 'vertical' else '-横屏'}.jpg")
+
     @app.post("/api/drafts/{did}/video/render")
-    def video_render(did: int):
+    def video_render(did: int, format: str = "vertical"):
+        if format not in video.FORMATS:
+            raise HTTPException(400, "不认识的画幅")
         state = video.load(_video_draft(did))
         if state.get("status"):
             return state
@@ -829,21 +1186,48 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             video.evolink_key(settings)
         except video.VideoError as exc:
             raise HTTPException(400, str(exc)) from None
-        state.update(status="rendering", stage="排队中", pct=0, error=None)
+        state.update(status="rendering", stage="排队中", pct=0, error=None, rendering=format)
         video.save(did, state)
-        jobs.enqueue("video_render", {"draft_id": did})
+        jobs.enqueue("video_render", {"draft_id": did, "format": format})
         return state
 
     @app.get("/api/drafts/{did}/video.mp4")
-    def video_file(did: int, download: int = 0):
+    def video_file(did: int, download: int = 0, format: str = "vertical"):
         draft = _video_draft(did)
-        path = video.video_path(did)
+        path = video.video_path(did, format if format in video.FORMATS else "vertical")
         if not path.exists():
             raise HTTPException(404)
         if not download:
             return FileResponse(path, media_type="video/mp4")
         name = re.sub(r"[^\w\u4e00-\u9fff-]+", "", draft["title"] or "视频")[:24] or "video"
-        return FileResponse(path, media_type="video/mp4", filename=f"{name}.mp4")
+        side = "" if format == "vertical" else "-横屏"
+        return FileResponse(path, media_type="video/mp4", filename=f"{name}{side}.mp4")
+
+    @app.post("/api/drafts/{did}/video/publish")
+    def video_publish(did: int, body: dict = Body(...)):
+        """Send a render out: a post on X (goes out at once), or the 公众号 素材库."""
+        if body.get("confirm") is not True:
+            raise HTTPException(400, "需要确认")
+        draft = _video_draft(did)
+        target, fmt, text = body.get("target"), body.get("format"), str(body.get("text") or "")
+        if target not in video.SEND_PLATFORMS or fmt not in video.FORMATS:
+            raise HTTPException(400, "不认识的平台或画幅")
+        if target == "x":
+            if not store.get("x_tokens"):
+                raise HTTPException(400, "X 还没连接，先去设置里连接")
+            if x_weighted_length(text) > X_LIMIT:
+                raise HTTPException(400, "文字超过 X 字数上限")
+        elif not (store.get("wx_appid") and store.get("wx_secret")):
+            raise HTTPException(400, "先在设置里填公众号的 AppID 和 AppSecret")
+        try:
+            return video.send(settings, store, draft, target, fmt, text)
+        except video.VideoError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.get("/api/drafts/{did}/video/publications")
+    def video_publications(did: int):
+        _video_draft(did)
+        return video.sends(did)
 
     @app.post("/api/drafts/{did}/video/preview")
     def video_preview(did: int, body: dict = Body(...)):
@@ -853,7 +1237,8 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
             raise HTTPException(400, "缺少镜头")
         try:
             return video.preview(settings, did, max(0, int(body.get("index") or 0)), body["scene"],
-                                 last=bool(body.get("last")), voice_now=bool(body.get("speak")))
+                                 last=bool(body.get("last")), voice_now=bool(body.get("speak")),
+                                 fmt=body.get("format") if body.get("format") in video.FORMATS else "vertical")
         except video.VideoError as exc:
             raise HTTPException(400, str(exc)) from None
 
@@ -915,6 +1300,13 @@ def create_app(settings: Settings | None = None, start_jobs: bool = True) -> Fas
     def publications():
         return db.rows("""SELECT p.*, d.title FROM publications p LEFT JOIN drafts d ON d.id=p.draft_id
                           ORDER BY p.id DESC LIMIT 100""")
+
+    @app.get("/api/publications/{pid}")
+    def publication(pid: int):
+        found = db.row("SELECT * FROM publications WHERE id=?", (pid,))
+        if not found:
+            raise HTTPException(404)
+        return {**found, **pushing.get(pid, {})}
 
     @app.get("/api/publish/x/connect")
     def x_connect():

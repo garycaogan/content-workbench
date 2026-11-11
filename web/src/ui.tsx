@@ -76,7 +76,8 @@ export function PlatformPill({ platform }: { platform: string }) {
 }
 
 export function PlatformIcon({ platform }: { platform: string }) {
-  return platform === 'x'
+  if (platform === 'wechat_video') return <span className="src-icon wechat"><Ic.Film size={16} /></span>
+  return platform === 'x' || platform.startsWith('x_')
     ? <span className="src-icon x"><Ic.XLogo size={14} /></span>
     : <span className="src-icon wechat"><Ic.Doc size={16} /></span>
 }
@@ -93,8 +94,13 @@ export function useAutosize(value: string) {
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
-    el.style.height = 'auto'
-    el.style.height = el.scrollHeight + 'px'
+    const fit = () => { el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px' }
+    fit()
+    // not laid out yet (inside a dialog that opens right after this): measure once it is
+    if (!el.offsetParent) {
+      const f = requestAnimationFrame(fit)
+      return () => cancelAnimationFrame(f)
+    }
   }, [value])
   return ref
 }
