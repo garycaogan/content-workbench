@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import whisper
 from .config import data_dir
 
 LARK_ENV = {**os.environ, "LARKSUITE_CLI_NO_UPDATE_NOTIFIER": "1", "LARKSUITE_CLI_NO_SKILLS_NOTIFIER": "1"}
@@ -80,27 +81,21 @@ def fetch_doc(url: str) -> tuple[str, str]:
 
 
 def transcription_available() -> bool:
-    try:
-        import mlx_whisper  # noqa: F401
-        return True
-    except Exception:
-        return False
+    return whisper.available()
 
 
 WHISPER_MODEL = os.environ.get("CW_WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
 
 
 def transcribe(path: Path) -> str:
-    """Local transcription on Apple silicon; the audio never leaves the machine."""
-    try:
-        import mlx_whisper
-    except Exception:
-        raise SourceError("本机还没装语音转写组件（mlx-whisper）") from None
+    """Local transcription on Apple silicon; the audio never leaves the machine.
+    Runs in a child process (whisper.py), so the server keeps none of Whisper's memory."""
+    if not whisper.available():
+        raise SourceError("本机还没装语音转写组件（mlx-whisper）")
     from .config import Settings
     vocab = Settings.load().transcribe_vocab.strip()
-    result = mlx_whisper.transcribe(str(path), path_or_hf_repo=WHISPER_MODEL, language="zh",
-                                    initial_prompt="以下是普通话的口述工作记录。" + (f"常见词：{vocab}。" if vocab else ""))
-    return (result.get("text") or "").strip()
+    result, = whisper.transcribe([path], WHISPER_MODEL, "以下是普通话的口述工作记录。" + (f"常见词：{vocab}。" if vocab else ""))
+    return result["text"].strip()
 
 
 # ------------------------------------------------------------------ Feishu library

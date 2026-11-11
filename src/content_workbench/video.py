@@ -29,7 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import db, images, llm, prompts, video_scenes as vs
+from . import db, images, llm, prompts, video_scenes as vs, whisper
 from .comments import plain
 from .config import Settings, data_dir
 
@@ -54,8 +54,8 @@ TYPE_NAMES = {"hook": "开头大字", "points": "要点卡片", "shot": "截图�
               "quote": "金句", "cta": "结尾"}
 SAY_MAX = 160
 PUNCT = "，。？！、：；,.?!:;—…“”\"'（）()《》「」【】 \n"
-# a render and an editor preview can both reach for Whisper or the font cache
-_WHISPER_LOCK, _FONT_LOCK = threading.Lock(), threading.Lock()
+# a render and an editor preview can both reach for the font cache (whisper.py serializes Whisper)
+_FONT_LOCK = threading.Lock()
 
 
 class VideoError(RuntimeError):
@@ -342,11 +342,7 @@ def duration_of(path: Path) -> float:
 # ------------------------------------------------------------------ timing
 
 def whisper_available() -> bool:
-    try:
-        import mlx_whisper  # noqa: F401
-        return True
-    except Exception:
-        return False
+    return whisper.available()
 
 
 def vocab_prompt(vocab: str) -> str:
@@ -356,23 +352,22 @@ def vocab_prompt(vocab: str) -> str:
     return "以下是普通话口播。" + (f"常见词：{vocab}。" if vocab else "")
 
 
-def heard_chars(path: Path, vocab: str = "") -> list[tuple[str, float, float]]:
-    """Characters Whisper heard, each with a time (a word's span split evenly).
+def heard_chars(paths: list[Path], vocab: str = "", each=None) -> list[list[tuple[str, float, float]]]:
+    """For each file, the characters Whisper heard, each with a time (a word's span
+    split evenly). All files go through one Whisper child process (whisper.py).
     Only a short vocabulary prompt: given the whole line, Whisper copies it and
     stops giving word times after the first garbled character."""
-    import mlx_whisper
-    with _WHISPER_LOCK:
-        res = mlx_whisper.transcribe(str(path), path_or_hf_repo=WHISPER, language="zh", word_timestamps=True,
-                                     initial_prompt=vocab_prompt(vocab))
-    chars = []
-    for seg in res.get("segments", []):
-        for w in seg.get("words", []):
+    out = []
+    for res in whisper.transcribe(paths, WHISPER, vocab_prompt(vocab), words=True, each=each):
+        chars = []
+        for w in res["words"]:
             text = "".join(c for c in w["word"] if c not in PUNCT)
             if not text:
                 continue
             step = (w["end"] - w["start"]) / len(text)
             chars.extend((c.lower(), w["start"] + i * step, w["start"] + (i + 1) * step) for i, c in enumerate(text))
-    return chars
+        out.append(chars)
+    return out
 
 
 def align(spoken: str, heard: list, total: float) -> list[tuple[float, float] | None]:
@@ -744,18 +739,32 @@ def voice_cache(voice: str, spoken: str) -> Path:
     return cache / (hashlib.sha1(f"{voice}|{INSTRUCTION}|{spoken}".encode()).hexdigest()[:16] + ".wav")
 
 
+def timed_lines(todo: list[tuple[str, Path, Path]], vocab: str, use_whisper: bool, each=None) -> list[dict]:
+    """For each (spoken, cached voice, scene clip): the voice padded into the clip,
+    and when each character is said (cached next to the voice). Lines without
+    saved times are heard by Whisper together, in one child process;
+    ``each(n, of)`` is called as the n-th of them is done."""
+    lines, fresh = [], []
+    for spoken, raw, clip in todo:
+        ffmpeg("-i", str(raw), "-af", f"adelay={int(LEAD_S * 1000)},apad=pad_dur={TAIL_S}", "-ar", "48000", "-ac", "1", str(clip))
+        line = {"clip": clip, "raw": raw, "duration": max(2.0, duration_of(clip)), "times": None}
+        saved = raw.with_suffix(f".{LEAD_S}-{TAIL_S}{'-w' if use_whisper else ''}.times.json")
+        if saved.exists():
+            line["times"] = [tuple(t) if t else None for t in json.loads(saved.read_text())]
+        else:
+            fresh.append((line, spoken, saved))
+        lines.append(line)
+    heard = [[] for _ in fresh]
+    if use_whisper and fresh:
+        heard = heard_chars([line["clip"] for line, _, _ in fresh], vocab, each=each and (lambda n: each(n, len(fresh))))
+    for (line, spoken, saved), chars in zip(fresh, heard):
+        line["times"] = align(spoken, chars, line["duration"])
+        saved.write_text(json.dumps(line["times"]))
+    return lines
+
+
 def timed_line(spoken: str, raw: Path, clip: Path, vocab: str, use_whisper: bool) -> dict:
-    """The cached voice padded into the scene's clip, and when each character is
-    said (cached next to the voice)."""
-    ffmpeg("-i", str(raw), "-af", f"adelay={int(LEAD_S * 1000)},apad=pad_dur={TAIL_S}", "-ar", "48000", "-ac", "1", str(clip))
-    duration = max(2.0, duration_of(clip))
-    saved = raw.with_suffix(f".{LEAD_S}-{TAIL_S}{'-w' if use_whisper else ''}.times.json")
-    if saved.exists():
-        times = [tuple(t) if t else None for t in json.loads(saved.read_text())]
-    else:
-        times = align(spoken, heard_chars(clip, vocab) if use_whisper else [], duration)
-        saved.write_text(json.dumps(times))
-    return {"clip": clip, "raw": raw, "duration": duration, "times": times}
+    return timed_lines([(spoken, raw, clip)], vocab, use_whisper)[0]
 
 
 def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], list[float]]:
@@ -786,13 +795,12 @@ def build_project(settings: Settings, draft_id: int) -> tuple[Path, list[dict], 
             done += 1
             _progress(draft_id, f"配音 {done}/{len(todo)}", int(5 + 25 * done / len(todo)))
 
-    # 2. when each character is said (cached next to the voice clip)
-    use_whisper = whisper_available()
-    lines = []
-    for n, (spoken, segs, raw) in enumerate(todo, 1):
-        _progress(draft_id, f"对齐字幕 {n}/{len(todo)}", int(30 + 15 * n / len(todo)))
-        line = timed_line(spoken, raw, assets / "audio" / f"voice-{n:02d}.wav", settings.transcribe_vocab, use_whisper)
-        lines.append({**line, "spoken": spoken, "segs": segs})
+    # 2. when each character is said (cached next to the voice clip; new lines in one Whisper run)
+    _progress(draft_id, "对齐字幕", 30)
+    timed = timed_lines([(spoken, raw, assets / "audio" / f"voice-{n:02d}.wav") for n, (spoken, _segs, raw) in enumerate(todo, 1)],
+                        settings.transcribe_vocab, whisper_available(),
+                        each=lambda n, of: _progress(draft_id, f"对齐字幕 {n}/{of}", int(30 + 15 * n / of)))
+    lines = [{**line, "spoken": spoken, "segs": segs} for line, (spoken, segs, _raw) in zip(timed, todo)]
 
     # 3. compositions
     _progress(draft_id, "准备画面", 46)
