@@ -50,7 +50,7 @@
 - 小红书个人号没有发布接口，工作台只负责把图和字准备好，最后在小红书 App 里存草稿或发布。
 - 知识星球没有开放接口，用的是星球网页自己调的接口，星球改版时可能需要跟着改。
 - 起稿和改稿调用的是你电脑上登录的 Claude Code（你自己的订阅），文字会发给 Anthropic 处理，不是离线运行。
-- 短视频的配音调用 Evolink 的中文 TTS（按量计费，一条两分钟的片子几分钱），口播文字会发给它处理；对齐字幕和渲染在本机。用自己的声音配音时，那段朗读录音也会上传到 Evolink 的文件服务用于复刻（随机链接，72 小时后失效）。
+- 短视频的配音调用 Evolink 的中文 TTS（按量计费，一条两分钟的片子几分钱），口播文字会发给它处理；对齐字幕和渲染在本机。用自己的声音配音时，那段朗读录音也会上传到 Evolink 的文件服务用于复刻（随机链接，72 小时后失效）。如果你的声音是在 MiniMax 上复刻的（填了 `minimax_voice_id`），“我的声音”的口播文字改发给 MiniMax 合成，不经过 Evolink。
 
 ## 怎么装
 
@@ -108,6 +108,8 @@ uv sync --extra transcribe            # 不需要录音转写就去掉 --extra t
 | `video_tagline` | 视频左上角名字下面的一行小字 |
 | `video_bgm` | 背景音乐文件（wav/mp3），不填就用数据目录里的 `video/bgm.wav`，都没有就不配乐 |
 | `video_clone_ref` / `video_clone_name` | 用你自己的声音配音：一段你本人朗读的录音（10 到 60 秒，单声道 WAV），Evolink 据此复刻音色，音色列表里会多出这一项（名字默认“我的声音”）；`video_voice` 填 `clone` 就默认用它。复刻出的音色 6 小时过期，工作台会自动重新复刻 |
+| `minimax_key_file` / `minimax_voice_id` | 可选：你已经在 MiniMax（国内站）复刻好的音色。填了音色 id，“我的声音”就用 MiniMax 合成，不再走 Evolink 复刻；MiniMax 出错会直接报错，不会换成别的音色。key 文件权限 600 |
+| `minimax_speed` / `minimax_model` / `minimax_host` | MiniMax 的语速（默认 1.0，克隆音色偏慢可以填 1.1）、模型（默认 `speech-2.8-hd`）和接口地址（默认 `https://api.minimaxi.com`） |
 
 平台凭证（X、公众号、知识星球）在设置页里填或扫码，只存在本机的 `secrets.json`，页面上只显示“已填/未填”。
 

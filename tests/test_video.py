@@ -327,6 +327,57 @@ def test_own_voice_is_offered_by_the_api_when_configured(tmp_path):
     assert c.put(f"/api/drafts/{did}/video", json={"voice": "clone"}, headers=H).json()["voice"] == "clone"
 
 
+def test_own_voice_on_minimax_is_read_there_and_never_falls_back_to_evolink(monkeypatch, tmp_path):
+    import io
+    import urllib.request
+    import pytest
+    keyf = tmp_path / "mm.key"
+    keyf.write_text("mm-secret\n")
+    s = Settings(minimax_voice_id="Me01", minimax_key_file=str(keyf), minimax_speed=1.1, video_voice="clone",
+                 video_clone_ref=str(tmp_path / "old.wav"))  # an old Evolink recording setting does not matter
+    assert video.voices(s)[0]["id"] == "clone" and "MiniMax" in video.voices(s)[0]["desc"] and video.default_voice(s) == "clone"
+    assert video.voice_key(s, "clone") == "minimax-Me01-speech-2.8-hd-1.1"
+    assert video.tts_key(s, "clone") == ""  # no Evolink key needed for the author's voice
+    assert video.options(s)["tts"] is True
+
+    def no_evolink(*a, **k):
+        raise AssertionError("went to Evolink")
+    monkeypatch.setattr(video, "synth", no_evolink)
+    monkeypatch.setattr(video, "cloned_voice", no_evolink)
+    monkeypatch.setattr(video.time, "sleep", lambda s: None)
+    sent, replies = [], []
+
+    def fake_open(req, timeout=0):
+        sent.append((req.full_url, req.headers.get("Authorization"), json.loads(req.data)))
+        return io.BytesIO(json.dumps(replies.pop(0)).encode())
+    monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+
+    ok = {"base_resp": {"status_code": 0, "status_msg": "success"}, "data": {"audio": b"RIFFwav".hex()}}
+    replies[:] = [{"base_resp": {"status_code": 1002, "status_msg": "rate limit"}}, ok]  # a rate limit is tried again
+    video.speak(s, "", "一句话", "clone", tmp_path / "out.wav")
+    assert (tmp_path / "out.wav").read_bytes() == b"RIFFwav" and len(sent) == 2
+    url, auth, body = sent[-1]
+    assert url == "https://api.minimaxi.com/v1/t2a_v2" and auth == "Bearer mm-secret"
+    assert body["model"] == "speech-2.8-hd" and body["text"] == "一句话" and body["voice_setting"]["voice_id"] == "Me01"
+    assert body["voice_setting"]["speed"] == 1.1 and body["audio_setting"]["format"] == "wav"
+
+    # a failure says why and stops; nothing is read by another voice
+    sent.clear()
+    replies[:] = [{"base_resp": {"status_code": 1008, "status_msg": "insufficient balance"}}]
+    with pytest.raises(video.VideoError, match="1008.*余额不足.*没有换成别的音色"):
+        video.speak(s, "", "一句话", "clone", tmp_path / "x.wav")
+    assert len(sent) == 1 and not (tmp_path / "x.wav").exists()
+
+    # no key file: refused before anything is built, still without Evolink
+    s.minimax_key_file = str(tmp_path / "missing.key")
+    with pytest.raises(video.VideoError, match="minimax_key_file"):
+        video.tts_key(s, "clone")
+    # presets still use the Evolink key; without MiniMax settings the old clone path is unchanged
+    monkeypatch.setattr(video, "evolink_key", lambda st: "ev")
+    assert video.tts_key(s, "longanyang_v3.1") == "ev" and video.tts_key(Settings(), "clone") == "ev"
+    assert video.voices(Settings()) == video.VOICES
+
+
 def test_planner_picks_a_style_and_the_author_can_switch_it_and_render_landscape(monkeypatch):
     c = client()
     login(c)

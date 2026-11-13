@@ -4,7 +4,8 @@ Two steps, like the 小红书 version: the AI writes a scene-by-scene script (wh
 is said, what is on screen, which screenshot and which part of it), the author
 edits it, then 出片 turns it into an MP4 on this machine:
 
-  voice    Evolink's Chinese TTS, one clip per scene, cached by text
+  voice    Evolink's Chinese TTS (or the author's voice cloned on MiniMax),
+           one clip per scene, cached by text
   timing   local Whisper (when installed) finds when each word is said, so
            captions and on-screen pieces land on the spoken word
   picture  each scene becomes a HyperFrames composition (video_scenes.py), the
@@ -267,9 +268,12 @@ def _digest(path: Path) -> str:
 
 def voice_key(settings: Settings, voice: str) -> str:
     """What the voice cache is keyed on: the preset's id, or for the cloned voice
-    the recording itself (the clone's id changes every few hours, the voice doesn't)."""
+    the recording itself (the clone's id changes every few hours, the voice doesn't),
+    or the MiniMax voice with its model and speed."""
     if voice != CLONE:
         return voice
+    if minimax_clone(settings):
+        return f"minimax-{settings.minimax_voice_id}-{settings.minimax_model}-{float(settings.minimax_speed or 1.0)}"
     ref = clone_ref(settings)
     return f"clone-{_digest(ref)}" if ref else CLONE
 
@@ -314,10 +318,76 @@ def cloned_voice(settings: Settings, key: str, fresh: bool = False) -> str:
         return voice
 
 
+# ------------------------------------------------------------------ or a voice cloned on MiniMax
+#
+# When minimax_voice_id is set, the author's own voice is that voice, read by
+# MiniMax's T2A (China site). It does not expire. A MiniMax failure is reported
+# as it is: the line is never quietly read by the Evolink clone instead.
+
+MINIMAX_RETRY = {1000, 1001, 1002, 1013, 1039}  # unknown, timeout, rate limit, service error, token limit
+MINIMAX_WHY = {1004: "key 不对或已失效", 1008: "MiniMax 账户余额不足", 2054: "这个音色 id 在 MiniMax 上不存在",
+               2013: "参数不对（音色 id、模型或语速）", 1026: "文字触发了内容审核", 1027: "生成的内容触发了审核"}
+
+
+def minimax_clone(settings: Settings) -> bool:
+    return bool(settings.minimax_voice_id)
+
+
+def minimax_key(settings: Settings) -> str:
+    path = Path(settings.minimax_key_file).expanduser() if settings.minimax_key_file else None
+    if not path or not path.is_file():
+        raise VideoError("还没配置 MiniMax key（设置里的 minimax_key_file），「我的声音」配不了音")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def minimax_synth(settings: Settings, text: str, out: Path) -> None:
+    body = {"model": settings.minimax_model or "speech-2.8-hd", "text": text, "stream": False, "language_boost": "Chinese",
+            "voice_setting": {"voice_id": settings.minimax_voice_id, "speed": float(settings.minimax_speed or 1.0), "vol": 1, "pitch": 0},
+            "audio_setting": {"sample_rate": 44100, "format": "wav", "channel": 1}}
+    key = minimax_key(settings)
+    url = (settings.minimax_host or "https://api.minimaxi.com").rstrip("/") + "/v1/t2a_v2"
+    why = ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(3 * attempt)
+        req = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(), method="POST",
+                                     headers={"Authorization": "Bearer " + key, "Content-Type": "application/json", **UA})
+        try:
+            r = json.loads(urllib.request.urlopen(req, timeout=120).read())
+        except urllib.error.HTTPError as exc:
+            why = f"HTTP {exc.code} {exc.read().decode('utf-8', 'replace')[:200]}"
+            if exc.code < 500 and exc.code != 429:
+                break
+            continue
+        except (urllib.error.URLError, OSError) as exc:
+            why = f"连不上 MiniMax：{getattr(exc, 'reason', exc)}"
+            continue
+        base = r.get("base_resp") or {}
+        code = base.get("status_code")
+        audio = (r.get("data") or {}).get("audio")
+        if code == 0 and audio:
+            out.write_bytes(bytes.fromhex(audio))
+            return
+        why = f"{code} {base.get('status_msg') or '没有返回音频'}" + (f"，{MINIMAX_WHY[code]}" if code in MINIMAX_WHY else "")
+        if code not in MINIMAX_RETRY:
+            break
+    raise VideoError(f"MiniMax 配音失败（{why}），没有换成别的音色")
+
+
+def tts_key(settings: Settings, voice: str) -> str:
+    """The Evolink key, unless the line is read by the MiniMax clone (which brings its own)."""
+    if voice == CLONE and minimax_clone(settings):
+        minimax_key(settings)  # missing key: say so before anything is built
+        return ""
+    return evolink_key(settings)
+
+
 def speak(settings: Settings, key: str, text: str, voice: str, out: Path) -> None:
     """One line in the chosen voice: a preset, or the author's cloned voice."""
     if voice != CLONE:
         return synth(key, text, voice, out)
+    if minimax_clone(settings):
+        return minimax_synth(settings, text, out)
     try:
         synth(key, text, cloned_voice(settings, key), out, language="zh")
     except VoiceExpired:  # expired early: clone once more and retry
@@ -325,7 +395,8 @@ def speak(settings: Settings, key: str, text: str, voice: str, out: Path) -> Non
 
 
 def voices(settings: Settings) -> list[dict]:
-    mine = [{"id": CLONE, "name": settings.video_clone_name or "我的声音", "desc": "用你自己的录音复刻"}] if clone_ref(settings) else []
+    desc = "用你自己的声音（MiniMax 复刻）" if minimax_clone(settings) else "用你自己的录音复刻"
+    mine = [{"id": CLONE, "name": settings.video_clone_name or "我的声音", "desc": desc}] if minimax_clone(settings) or clone_ref(settings) else []
     return mine + VOICES
 
 
@@ -1028,8 +1099,8 @@ def build_project(settings: Settings, draft_id: int, fmt: str = "vertical") -> t
     scenes = [s for s in state.get("scenes") or [] if str(s.get("say", "")).strip()]
     if not scenes:
         raise VideoError("脚本是空的")
-    key = evolink_key(settings)
     voice = draft_voice(settings, state)
+    key = tts_key(settings, voice)
     root = work_dir(draft_id, fmt)
     shutil.rmtree(root, ignore_errors=True)
     assets = root / "assets"
@@ -1168,7 +1239,7 @@ def preview(settings: Settings, draft_id: int, index: int, scene: dict, last: bo
     spoken, segs = speakable(s["say"])
     raw = voice_cache(voice_key(settings, voice), spoken)
     if voice_now and not raw.exists():
-        speak(settings, evolink_key(settings), spoken, voice, raw)
+        speak(settings, tts_key(settings, voice), spoken, voice, raw)
     voiced = raw.exists()
     author = settings.author or prompts.persona(settings)["name"]
     key = hashlib.sha1(json.dumps([s, voice_key(settings, voice), voiced, index, last, author, settings.video_tagline, frame.key, style.key,
@@ -1562,7 +1633,8 @@ def overview() -> list[dict]:
 
 
 def options(settings: Settings) -> dict:
-    key_ok = bool(settings.evolink_key_file and Path(settings.evolink_key_file).expanduser().is_file())
+    key_ok = any(f and Path(f).expanduser().is_file()
+                 for f in (settings.evolink_key_file, minimax_clone(settings) and settings.minimax_key_file))
     return {"voices": voices(settings), "default_voice": default_voice(settings), "tts": key_ok,
             "whisper": whisper_available(), "types": TYPE_NAMES,
             "styles": [{"id": s.key, "name": s.name, "hint": s.hint, "headline": s.headline} for s in vs.STYLES.values()],

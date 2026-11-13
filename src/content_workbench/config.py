@@ -73,6 +73,14 @@ class Settings:
     # Evolink clones; it shows up as a voice ("clone") named video_clone_name
     video_clone_ref: str = ""
     video_clone_name: str = ""
+    # or a voice already cloned on MiniMax (China site). When minimax_voice_id is
+    # set, the "clone" voice is that one and never goes to Evolink; the key file
+    # holds a MiniMax API key (0600)
+    minimax_key_file: str = ""
+    minimax_voice_id: str = ""
+    minimax_model: str = "speech-2.8-hd"
+    minimax_speed: float = 1.0
+    minimax_host: str = "https://api.minimaxi.com"
     # Cloudflare Access in front of a public domain. When access_team is set,
     # every request must carry a valid Access token for access_aud.
     access_team: str = ""
